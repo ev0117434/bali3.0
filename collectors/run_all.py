@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-run_all.py — запускает все 8 WS-коллекторов в одном процессе.
+run_all.py — запускает все 8 WS-коллекторов + staleness_monitor в одном процессе.
 
 Каждый коллектор работает как отдельная asyncio-задача.
 Общий лог-поток: stdout в формате JSON (script поле указывает источник).
 
 Запуск:
     python3 collectors/run_all.py
+    python3 collectors/run_all.py --buckets     # staleness с корзинами
     python3 collectors/run_all.py 2>&1 | tee logs/collectors.log
 """
 
+import argparse
 import asyncio
 import importlib
 import sys
@@ -49,9 +51,15 @@ async def run_collector(name: str) -> None:
         log("ERROR", "collector_crashed", collector=name, reason=str(e))
 
 
-async def main() -> None:
-    log("INFO", "startup", collectors=COLLECTORS)
+async def main(with_buckets: bool = False) -> None:
+    log("INFO", "startup", collectors=COLLECTORS, staleness_buckets=with_buckets)
     tasks = [asyncio.create_task(run_collector(name)) for name in COLLECTORS]
+
+    # Staleness monitor
+    staleness = importlib.import_module("staleness_monitor")
+    tasks.append(asyncio.create_task(staleness.main(with_buckets)))
+    log("INFO", "collector_started", collector="staleness_monitor")
+
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
@@ -63,7 +71,15 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run all market data collectors")
+    parser.add_argument(
+        "--buckets",
+        action="store_true",
+        help="Enable age-bucket distribution in staleness_monitor",
+    )
+    args = parser.parse_args()
+
     try:
-        asyncio.run(main())
+        asyncio.run(main(args.buckets))
     except KeyboardInterrupt:
         pass
