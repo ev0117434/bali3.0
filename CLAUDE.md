@@ -61,4 +61,65 @@ Normalization: remove hyphens/underscores and `-SWAP` suffix.
 
 ### Redis
 
-Configured via `setup_redis.sh`: Unix socket only (`/var/run/redis/redis.sock`), no persistence (`volatile-lru` eviction), latency-optimized. Used by downstream collectors, not by `dictionaries/main.py` itself.
+Configured via `setup_redis.sh`: Unix socket only (`/var/run/redis/redis.sock`), no persistence (`volatile-ttl` eviction), latency-optimized. Used by downstream collectors, not by `dictionaries/main.py` itself.
+
+#### Правила написания кода с Redis
+
+**Зависимости:** `pip install redis[hiredis] orjson`
+
+**Подключение:**
+```python
+import redis.asyncio as aioredis
+r = aioredis.Redis(
+    unix_socket_path='/var/run/redis/redis.sock',
+    decode_responses=False,  # всегда False, работаем с bytes
+    max_connections=20,
+)
+```
+
+**Pipeline — обязательно всегда**, никогда одиночные команды:
+```python
+async with r.pipeline(transaction=False) as pipe:  # transaction=False всегда
+    pipe.hset('key', mapping={...})
+    pipe.zadd('hist_key', {payload: now_ms})
+    await pipe.execute()
+```
+
+**Батчинг в коллекторе:** накапливать до 100 команд или сбрасывать каждые 20ms.
+
+**Формат ZSET member** — pipe-separated строка, не JSON:
+```python
+val = f'{bid}|{ask}|{bid_qty}|{ask_qty}|{ts}'  # 50 bytes вместо 95
+pipe.zadd(key, {val.encode(): now_ms})
+```
+
+**ZRANGEBYSCORE — всегда с LIMIT** (`num=500`), иначе заблокирует Redis на больших наборах.
+
+**Pub/Sub — отдельный клиент** (подписка блокирует соединение).
+
+**Обработка ошибок:** оборачивать в `try/except (ConnectionError, TimeoutError)` с retry (3 попытки, `sleep(0.1 * attempt)`).
+
+#### Схема ключей (может меняться)
+
+> Текущие имена ключей — рабочий вариант, будут уточнены. При изменении — обновить здесь.
+
+| Ключ | Тип | Описание |
+|------|-----|----------|
+| `p:bn:s:BTCUSDT` | HASH | Текущая цена (price, binance, spot) |
+| `h:bn:s:BTCUSDT` | ZSET | История тиков |
+| `pr:bn:s` | SET | Множество активных пар |
+| `sig:bn_s:bb_f:BTCUSDT` | STRING | Последний сигнал спреда |
+
+**Сокращения:** `bn`=binance, `bb`=bybit, `ok`=okx, `gt`=gate · `s`=spot, `f`=futures
+
+**Поля HASH:** `b`=bid, `a`=ask, `bq`=bid_qty, `aq`=ask_qty, `t`=exchange_ts, `lt`=local_ts
+
+#### Мониторинг
+
+```bash
+redis-cli -s /var/run/redis/redis.sock PING        # < 1ms = OK
+redis-cli -s /var/run/redis/redis.sock INFO memory  # fragmentation < 1.3
+redis-cli -s /var/run/redis/redis.sock SLOWLOG GET 10
+```
+
+Пороги: OK `PING < 1ms, memory < 60%` · WARN `> 1ms / > 60%` · CRIT `timeout / > 95% / blocked_clients > 0`
