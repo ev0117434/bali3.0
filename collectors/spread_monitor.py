@@ -23,6 +23,8 @@ from pathlib import Path
 import orjson
 import redis.asyncio as aioredis
 
+from hist_writer import write_snapshot_history
+
 SCRIPT = "spread_monitor"
 
 COMBO_DIR       = Path(__file__).parent.parent / "dictionaries" / "combination"
@@ -216,6 +218,12 @@ async def scan_cycle(
                 _fh       = open(_fname, "wb")
                 _fh.write(CSV_HEADER.encode())
                 _fh.flush()
+                # prepend 1-hour history
+                hist_rows = await write_snapshot_history(
+                    r, _fh, spot_ex, fut_ex, sym, spot_name, fut_name)
+                if hist_rows:
+                    log("INFO", "snapshot_history_written",
+                        direction=direction, symbol=sym, rows=hist_rows)
                 active_snapshots[snap_key] = {"fh": _fh, "expires": now + COOLDOWN_SEC}
                 log("INFO", "snapshot_opened", direction=direction, symbol=sym,
                     file=str(_fname), duration_sec=COOLDOWN_SEC)

@@ -21,6 +21,8 @@ import redis.asyncio as aioredis
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from hist_writer import HistWriter
+
 SCRIPT = "okx_spot"
 EX, MKT = "ok", "s"
 
@@ -76,11 +78,14 @@ def redis_key(sym: str) -> bytes:
 
 # ── Redis flush ───────────────────────────────────────────────────────────────
 
-async def flush(r: aioredis.Redis, batch: list, counters: dict) -> None:
+async def flush(r: aioredis.Redis, batch: list, hw: HistWriter, counters: dict) -> None:
     t0 = time.monotonic()
+    now_sec = time.time()
     async with r.pipeline(transaction=False) as pipe:
         for key, mapping in batch:
             pipe.hset(key, mapping=mapping)
+        hw.add_to_pipe(pipe, batch, now_sec)
+        hw.ensure_config(pipe, now_sec)
         await pipe.execute()
     lat_ms = (time.monotonic() - t0) * 1000
     counters["flushes"] += 1
@@ -105,6 +110,7 @@ async def ping_loop(ws, stop: asyncio.Event) -> None:
 async def collect_chunk(
     r: aioredis.Redis,
     inst_ids: list[str],    # native OKX format: BTC-USDT
+    hw: HistWriter,
     counters: dict,
     delay: float,
 ) -> None:
@@ -170,7 +176,7 @@ async def collect_chunk(
                     except Exception:
                         pass
                     if len(batch) >= BATCH_SIZE or (batch and now - last_flush >= BATCH_TIMEOUT):
-                        await flush(r, batch, counters)
+                        await flush(r, batch, hw, counters)
                         batch.clear()
                         last_flush = now
 
@@ -183,7 +189,7 @@ async def collect_chunk(
             stop.set()
             if batch:
                 try:
-                    await flush(r, batch, counters)
+                    await flush(r, batch, hw, counters)
                 except Exception:
                     pass
 
@@ -223,8 +229,9 @@ async def main() -> None:
     chunks = chunk(native, CHUNK_SIZE)
     log("INFO", "subscribing", total_symbols=len(syms), connections=len(chunks))
 
+    hw = HistWriter(EX, MKT, syms)
     tasks = [
-        asyncio.create_task(collect_chunk(r, ch, counters, i * CONNECT_DELAY))
+        asyncio.create_task(collect_chunk(r, ch, hw, counters, i * CONNECT_DELAY))
         for i, ch in enumerate(chunks)
     ]
     tasks.append(asyncio.create_task(stats_loop(counters)))

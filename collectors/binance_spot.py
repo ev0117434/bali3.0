@@ -16,6 +16,8 @@ import redis.asyncio as aioredis
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from hist_writer import HistWriter
+
 SCRIPT = "binance_spot"
 EX, MKT = "bn", "s"
 
@@ -58,11 +60,14 @@ def redis_key(sym: str) -> bytes:
 
 # ── Redis flush ───────────────────────────────────────────────────────────────
 
-async def flush(r: aioredis.Redis, batch: list, counters: dict) -> None:
+async def flush(r: aioredis.Redis, batch: list, hw: HistWriter, counters: dict) -> None:
     t0 = time.monotonic()
+    now_sec = time.time()
     async with r.pipeline(transaction=False) as pipe:
         for key, mapping in batch:
             pipe.hset(key, mapping=mapping)
+        hw.add_to_pipe(pipe, batch, now_sec)
+        hw.ensure_config(pipe, now_sec)
         await pipe.execute()
     lat_ms = (time.monotonic() - t0) * 1000
     counters["flushes"] += 1
@@ -71,7 +76,7 @@ async def flush(r: aioredis.Redis, batch: list, counters: dict) -> None:
 
 # ── per-chunk WS connection ───────────────────────────────────────────────────
 
-async def collect_chunk(r: aioredis.Redis, syms: list[str], counters: dict) -> None:
+async def collect_chunk(r: aioredis.Redis, syms: list[str], hw: HistWriter, counters: dict) -> None:
     url = ws_url(syms)
     while True:
         batch: list = []
@@ -113,7 +118,7 @@ async def collect_chunk(r: aioredis.Redis, syms: list[str], counters: dict) -> N
                     except Exception:
                         pass
                     if len(batch) >= BATCH_SIZE or (batch and now - last_flush >= BATCH_TIMEOUT):
-                        await flush(r, batch, counters)
+                        await flush(r, batch, hw, counters)
                         batch.clear()
                         last_flush = now
 
@@ -121,7 +126,7 @@ async def collect_chunk(r: aioredis.Redis, syms: list[str], counters: dict) -> N
             log("WARN", "disconnected", reason=str(e)[:120])
             if batch:
                 try:
-                    await flush(r, batch, counters)
+                    await flush(r, batch, hw, counters)
                 except Exception:
                     pass
 
@@ -160,7 +165,8 @@ async def main() -> None:
     chunks = chunk(syms, CHUNK_SIZE)
     log("INFO", "subscribing", total_symbols=len(syms), connections=len(chunks))
 
-    tasks = [asyncio.create_task(collect_chunk(r, ch, counters)) for ch in chunks]
+    hw = HistWriter(EX, MKT, syms)
+    tasks = [asyncio.create_task(collect_chunk(r, ch, hw, counters)) for ch in chunks]
     tasks.append(asyncio.create_task(stats_loop(counters)))
     await asyncio.gather(*tasks)
 

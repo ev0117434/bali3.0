@@ -21,6 +21,8 @@ import redis.asyncio as aioredis
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from hist_writer import HistWriter
+
 SCRIPT = "bybit_spot"
 EX, MKT = "bb", "s"
 
@@ -60,11 +62,14 @@ def redis_key(sym: str) -> bytes:
 
 # ── Redis flush ───────────────────────────────────────────────────────────────
 
-async def flush(r: aioredis.Redis, batch: list, counters: dict) -> None:
+async def flush(r: aioredis.Redis, batch: list, hw: HistWriter, counters: dict) -> None:
     t0 = time.monotonic()
+    now_sec = time.time()
     async with r.pipeline(transaction=False) as pipe:
         for key, mapping in batch:
             pipe.hset(key, mapping=mapping)
+        hw.add_to_pipe(pipe, batch, now_sec)
+        hw.ensure_config(pipe, now_sec)
         await pipe.execute()
     lat_ms = (time.monotonic() - t0) * 1000
     counters["flushes"] += 1
@@ -86,7 +91,7 @@ async def ping_loop(ws, stop: asyncio.Event) -> None:
 
 # ── recv loop ─────────────────────────────────────────────────────────────────
 
-async def recv_loop(ws, r: aioredis.Redis, counters: dict, stop: asyncio.Event,
+async def recv_loop(ws, r: aioredis.Redis, hw: HistWriter, counters: dict, stop: asyncio.Event,
                     t_connected: float, first_logged: list) -> None:
     batch: list = []
     last_flush = time.monotonic()
@@ -123,7 +128,7 @@ async def recv_loop(ws, r: aioredis.Redis, counters: dict, stop: asyncio.Event,
             except Exception:
                 pass
             if len(batch) >= BATCH_SIZE or (batch and now - last_flush >= BATCH_TIMEOUT):
-                await flush(r, batch, counters)
+                await flush(r, batch, hw, counters)
                 batch.clear()
                 last_flush = now
     except (ConnectionClosed, asyncio.CancelledError):
@@ -133,14 +138,14 @@ async def recv_loop(ws, r: aioredis.Redis, counters: dict, stop: asyncio.Event,
     finally:
         if batch:
             try:
-                await flush(r, batch, counters)
+                await flush(r, batch, hw, counters)
             except Exception:
                 pass
 
 
 # ── main connection loop ──────────────────────────────────────────────────────
 
-async def collect(r: aioredis.Redis, syms: list[str], counters: dict) -> None:
+async def collect(r: aioredis.Redis, syms: list[str], hw: HistWriter, counters: dict) -> None:
     batches = chunk(syms, SUB_BATCH)
     while True:
         stop = asyncio.Event()
@@ -164,7 +169,7 @@ async def collect(r: aioredis.Redis, syms: list[str], counters: dict) -> None:
                     subscribe_ms=round((time.monotonic() - t_sub) * 1000, 1))
 
                 first_logged = [False]
-                recv_task = asyncio.create_task(recv_loop(ws, r, counters, stop, t_connected, first_logged))
+                recv_task = asyncio.create_task(recv_loop(ws, r, hw, counters, stop, t_connected, first_logged))
                 ping_task = asyncio.create_task(ping_loop(ws, stop))
                 done, pending = await asyncio.wait(
                     [recv_task, ping_task],
@@ -211,8 +216,9 @@ async def main() -> None:
     log("INFO", "redis_connected", socket=REDIS_SOCK)
 
     counters = {"msgs": 0, "flushes": 0, "lat_total": 0.0}
+    hw = HistWriter(EX, MKT, syms)
     await asyncio.gather(
-        collect(r, syms, counters),
+        collect(r, syms, hw, counters),
         stats_loop(counters),
     )
 
