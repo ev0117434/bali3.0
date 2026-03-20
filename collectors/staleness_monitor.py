@@ -20,7 +20,7 @@ import orjson
 import redis.asyncio as aioredis
 
 REDIS_SOCK      = "/var/run/redis/redis.sock"
-KEY_PATTERN     = "md:*"
+KEY_PATTERN     = "md:??:?:*"   # matches md:bn:s:SYM only, excludes md:hist:*
 CHECK_INTERVAL  = 60       # секунд между проверками
 STALE_THRESHOLD = 300      # 5 минут = stale
 SCAN_COUNT      = 500      # ключей за один SCAN-вызов
