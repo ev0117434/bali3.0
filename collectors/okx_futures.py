@@ -30,6 +30,7 @@ WS_URL          = "wss://ws.okx.com:8443/ws/v5/public"
 
 CHUNK_SIZE      = 300
 CONNECT_DELAY   = 0.15
+SUB_BATCH       = 20      # args per subscribe message (OKX frame limit ~4KB)
 BATCH_SIZE      = 100
 BATCH_TIMEOUT   = 0.020
 PING_INTERVAL   = 25
@@ -127,9 +128,13 @@ async def collect_chunk(
                 max_queue=4096,
             ) as ws:
                 log("INFO", "connected", chunk_symbols=len(inst_ids))
-                args = [{"channel": "tickers", "instId": iid} for iid in inst_ids]
-                await ws.send(orjson.dumps({"op": "subscribe", "args": args}))
-                log("INFO", "subscribed", chunk_symbols=len(inst_ids))
+                sub_batches = chunk(inst_ids, SUB_BATCH)
+                for sb in sub_batches:
+                    args = [{"channel": "tickers", "instId": iid} for iid in sb]
+                    # OKX requires text frames (str), not binary (bytes)
+                    await ws.send(orjson.dumps({"op": "subscribe", "args": args}).decode())
+                    await asyncio.sleep(0.05)
+                log("INFO", "subscribed", chunk_symbols=len(inst_ids), sub_batches=len(sub_batches))
 
                 ping_task = asyncio.create_task(ping_loop(ws, stop))
 
