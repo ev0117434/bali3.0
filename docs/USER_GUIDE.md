@@ -8,14 +8,16 @@ Step-by-step instructions for setting up, running, and maintaining the system fr
 
 1. [First-time setup](#1-first-time-setup)
 2. [Generate trading pair dictionaries](#2-generate-trading-pair-dictionaries)
-3. [Start the collectors](#3-start-the-collectors)
+3. [Start the system](#3-start-the-system)
 4. [Reading the dashboard](#4-reading-the-dashboard)
 5. [Reading logs](#5-reading-logs)
-6. [Updating pair lists](#6-updating-pair-lists)
-7. [Stopping the system](#7-stopping-the-system)
-8. [Querying Redis directly](#8-querying-redis-directly)
-9. [Troubleshooting](#9-troubleshooting)
-10. [System health checks](#10-system-health-checks)
+6. [Reading signals](#6-reading-signals)
+7. [Updating pair lists](#7-updating-pair-lists)
+8. [Stopping the system](#8-stopping-the-system)
+9. [Querying Redis directly](#9-querying-redis-directly)
+10. [Troubleshooting](#10-troubleshooting)
+11. [System health checks](#11-system-health-checks)
+12. [Reference](#12-reference)
 
 ---
 
@@ -29,50 +31,49 @@ sudo bash setup_redis.sh
 
 This installs Redis, configures it for low-latency operation on a Unix socket, and starts the service. Takes about 30–60 seconds.
 
-Verify it worked:
+Verify:
 
 ```bash
 sudo bash setup_redis.sh --check
 ```
 
-You should see `PING: X.XXXms` in green. If you see `FAIL` in red, Redis is not running — re-run the setup script.
+You should see `PING: X.XXXms` in green. If you see `FAIL` in red — re-run the setup script.
 
 ### Install Python dependencies
 
 ```bash
-pip install websockets orjson redis[hiredis] rich aiohttp
+pip install websockets orjson redis[hiredis] rich
 ```
 
-### Clone and enter the project
+### Enter the project directory
 
 ```bash
 cd /root/bali3.0
 ```
 
-All commands below are run from this directory unless specified otherwise.
+All commands below assume this working directory.
 
 ---
 
 ## 2. Generate trading pair dictionaries
 
-**Run this once before starting collectors, and again whenever you want to refresh the pair list.**
+**Run once before first start, and again whenever you want to refresh the pair list.**
 
 ```bash
 cd dictionaries && python3 main.py && cd ..
 ```
 
-What happens during the ~70 seconds:
+Takes ~70 seconds:
 
 ```
-[0s]   Phase 1 — Connects to REST APIs for all 4 exchanges simultaneously
-[~5s]  Phase 2 — Opens WebSocket connections to all exchanges, listens for 60 seconds
-[~65s] Phase 3 — Builds 12 intersection files (which pairs are active on both exchanges)
-[~65s] Phase 4 — Builds 8 subscription files (which symbols each collector should subscribe to)
-[~65s] Phase 5 — Prints the statistics report
+[0s]   Phase 1 — REST API fetch from all 4 exchanges (parallel)
+[~5s]  Phase 2 — WebSocket validation, 60 second window (parallel)
+[~65s] Phase 3 — Build 12 intersection files (combination/)
+[~65s] Phase 4 — Build 8 subscription files (subscribe/)
+[~65s] Phase 5 — Print report
 ```
 
-**Expected result at the end:**
-
+**Expected output at the end:**
 ```
 subscribe/binance/binance_spot.txt:    418 symbols
 subscribe/binance/binance_futures.txt: 203 symbols
@@ -80,13 +81,14 @@ subscribe/bybit/bybit_spot.txt:        312 symbols
 ...
 ```
 
-If any exchange shows 0 symbols, that exchange likely had a connection issue — re-run.
+If any exchange shows 0 symbols — re-run (temporary connection issue).
 
 ### What gets generated
 
+**8 subscription files** — read by collectors at startup:
 ```
-dictionaries/subscribe/binance/binance_spot.txt    ← symbols for binance_spot collector
-dictionaries/subscribe/binance/binance_futures.txt ← symbols for binance_futures collector
+dictionaries/subscribe/binance/binance_spot.txt
+dictionaries/subscribe/binance/binance_futures.txt
 dictionaries/subscribe/bybit/bybit_spot.txt
 dictionaries/subscribe/bybit/bybit_futures.txt
 dictionaries/subscribe/okx/okx_spot.txt
@@ -95,48 +97,54 @@ dictionaries/subscribe/gate/gate_spot.txt
 dictionaries/subscribe/gate/gate_futures.txt
 ```
 
-These 8 files are read by collectors at startup.
+**12 combination files** — read by spread_monitor at startup:
+```
+dictionaries/combination/binance_spot_bybit_futures.txt
+dictionaries/combination/binance_spot_okx_futures.txt
+... (12 total: all spot×futures exchange pairs)
+```
 
 ---
 
-## 3. Start the collectors
+## 3. Start the system
 
-### Normal start (dashboard + logs to file)
-
-```bash
-python3 run_all.py > logs/collectors.log
-```
-
-- Dashboard renders in your terminal (updates every 2 seconds)
-- Clean JSON logs saved to `logs/collectors.log`
-- Press `Ctrl+C` to stop
-
-### Start with staleness bucket distribution
+### Normal start
 
 ```bash
-python3 run_all.py --buckets > logs/collectors.log
+python3 run_all.py
 ```
 
-Adds a log line every 60s showing how old the data is by 1-minute buckets:
-`fresh (<1min), 1-2min, 2-3min, 3-4min, 4-5min, 5+min (stale)`
+What happens on startup:
+1. Redis is flushed (all old keys removed)
+2. A new log file is opened: `logs/collectors_YYYY-MM-DD_HH-MM.log`
+3. All 8 collectors start connecting to their exchanges
+4. `staleness_monitor` and `spread_monitor` start
+5. Live dashboard appears in terminal
 
-### Start without dashboard (logs only)
+### Start with staleness age distribution
 
 ```bash
-python3 run_all.py --no-dash 2>&1 | tee logs/collectors.log
+python3 run_all.py --buckets
 ```
 
-Useful if you're running in a non-interactive environment or want raw JSON only.
+Adds a log line every 60s with key age distribution: `fresh (<1min), 1-2min, 2-3min, 3-4min, 4-5min, 5+min`.
+
+### Start without dashboard
+
+```bash
+python3 run_all.py --no-dash
+```
+
+Useful in non-interactive environments. JSON logs still go to the rotating log file.
 
 ### Run in background
 
 ```bash
-nohup python3 run_all.py > logs/collectors.log 2>&1 &
+nohup python3 run_all.py &
 echo $! > run_all.pid
 ```
 
-To stop background process:
-
+To stop:
 ```bash
 kill $(cat run_all.pid)
 ```
@@ -145,298 +153,349 @@ kill $(cat run_all.pid)
 
 ## 4. Reading the dashboard
 
-The dashboard shows live metrics per collector, updating every 2 seconds.
+The dashboard updates every 2 seconds. It shows 3 sections:
 
 ```
-Bali 3.0  uptime 120s
+Bali 3.0  uptime 120s  log collectors_2026-03-20_14-00.log
 ┌──────────────────────┬───────────┬────────┬───────────┬─────────┬─────────┬────────┬──────────┐
 │ Script               │ Status    │ msgs/s │ total     │ flushes │ pipe ms │ errors │ last seen│
+├──────────────────────┼───────────┼────────┼───────────┼─────────┼─────────┼────────┼──────────┤
+│ binance_spot         │ streaming │  823.4 │ 98,808    │   988   │  0.412  │   0    │     1s   │
+│ binance_futures      │ streaming │  411.2 │ 49,344    │   493   │  0.398  │   0    │     2s   │
+│ bybit_spot           │ streaming │  198.3 │ 23,796    │   238   │  0.501  │   0    │     1s   │
+│ bybit_futures        │ streaming │  145.7 │ 17,484    │   175   │  0.489  │   0    │     2s   │
+│ okx_spot             │ streaming │  312.1 │ 37,452    │   375   │  0.621  │   0    │     1s   │
+│ okx_futures          │ streaming │  278.4 │ 33,408    │   334   │  0.598  │   0    │     2s   │
+│ gate_spot            │ streaming │  201.5 │ 24,180    │   242   │  0.445  │   0    │     1s   │
+│ gate_futures         │ streaming │  189.2 │ 22,704    │   227   │  0.431  │   0    │     2s   │
+├──────────────────────┼───────────┼────────┼───────────┼─────────┼─────────┼────────┼──────────┤
+│ staleness_monitor    │ ok        │   —    │ 4,821     │ stale:0 │    —    │   0    │    12s   │
+├──────────────────────┼───────────┼────────┼───────────┼─────────┼─────────┼────────┼──────────┤
+│ spread_monitor       │ scanning  │   3    │ 47        │  cd:12  │  18.4   │   0    │     1s   │
+└──────────────────────┴───────────┴────────┴───────────┴─────────┴─────────┴─────────┴─────────┘
 ```
 
-### Column meanings
+### Collectors columns (top 8 rows)
 
 | Column | Description |
 |--------|-------------|
-| **Script** | Collector name |
-| **Status** | Current lifecycle state |
-| **msgs/s** | Messages received per second (updated every 30s) |
-| **total** | Total messages received since start |
-| **flushes** | Number of Redis pipeline batches executed |
-| **pipe ms** | Average Redis pipeline latency in milliseconds |
-| **errors** | Number of disconnection events |
-| **last seen** | Seconds since last log event from this script |
+| **msgs/s** | Market data messages per second (updates every 30s) |
+| **total** | Total messages since start |
+| **flushes** | Redis pipeline batches executed |
+| **pipe ms** | Average Redis pipeline latency |
+| **errors** | Disconnection count |
+| **last seen** | Seconds since last log event |
+
+### staleness_monitor row
+
+| Column | Description |
+|--------|-------------|
+| **total** | Total Redis keys being tracked |
+| **flushes** | `stale:N` — how many keys are currently stale |
+
+### spread_monitor row
+
+| Column | Description |
+|--------|-------------|
+| **msgs/s** | Signals fired in the last 30s interval |
+| **total** | Total signals since start (normal + anomaly) |
+| **flushes** | `cd:N` — active cooldowns |
+| **pipe ms** | Last poll cycle duration in ms (should be <300) |
 
 ### Status values
 
 | Status | Color | Meaning |
 |--------|-------|---------|
-| `starting` | dim | Script initialized, not yet connecting |
+| `starting` | dim | Initializing |
 | `connecting` | yellow | TCP connection in progress |
-| `connected` | cyan | WebSocket handshake complete, sending subscriptions |
-| `subscribed` | cyan | Subscriptions sent, waiting for first message |
-| `streaming` | **green** | Receiving market data — normal operating state |
-| `disconnected` | red | Connection lost, will auto-reconnect |
-| `reconnecting` | yellow | Waiting 3s before reconnect attempt |
+| `connected` | cyan | WS handshake done, sending subscriptions |
+| `subscribed` | cyan | Subscriptions sent, waiting for data |
+| `streaming` | **green** | Receiving market data — normal |
+| `scanning` | **green** | (spread_monitor) Actively polling Redis |
+| `ok` | **green** | (staleness_monitor) No stale keys |
+| `disconnected` | red | Connection lost, will reconnect in 3s |
+| `reconnecting` | yellow | Waiting before reconnect |
+| `STALE:N` | **red** | N keys stale > 5 minutes |
 | `CRASHED` | **bold red** | Unhandled exception — check logs |
-| `ok` | green | (staleness_monitor) Last check: no stale keys |
-| `STALE:N` | red | (staleness_monitor) N keys haven't updated in 5+ minutes |
-| `checking` | cyan | (staleness_monitor) Scan in progress |
 
-### Normal behavior timeline
+### Normal startup timeline
 
 ```
-0s   → all scripts show "connecting"
-2s   → "connected" then "subscribed"
-5s   → "streaming" (first_message event received)
-30s  → msgs/s and total columns populate with first stats
-60s  → staleness_monitor runs first check, shows "ok"
+0s   → all collectors show "connecting"
+2s   → "connected" → "subscribed"
+5s   → "streaming" (first market data received)
+5s   → spread_monitor shows "scanning"
+30s  → msgs/s and total columns fill in (first stats event)
+60s  → staleness_monitor first check → "ok"
 ```
 
-**Important:** `msgs/s = 0` and `total = 0` for the first 30 seconds is normal. Stats are reported every 30 seconds.
+**`msgs/s = 0` and `total = 0` for the first 30 seconds is normal.**
 
 ---
 
 ## 5. Reading logs
 
-Logs are written to `logs/collectors.log` as newline-delimited JSON.
-
-### Follow live
+Logs are written automatically to rotating files. No redirect needed.
 
 ```bash
-tail -f logs/collectors.log
-```
+# Show current log file name
+ls -t logs/collectors_*.log | head -1
 
-### Follow live with pretty print
+# Follow live
+tail -f logs/collectors_*.log
 
-```bash
-tail -f logs/collectors.log | jq .
+# Follow with pretty print
+tail -f logs/collectors_*.log | jq .
 ```
 
 ### Useful filters
 
 ```bash
-# Only errors and warnings
-jq 'select(.lvl == "WARN" or .lvl == "ERROR")' logs/collectors.log
+# All errors and warnings
+jq 'select(.lvl == "WARN" or .lvl == "ERROR")' logs/collectors_*.log
 
-# Stats from all collectors
-jq 'select(.event == "stats")' logs/collectors.log
+# Collector stats (msgs/s, pipeline latency)
+jq 'select(.event == "stats" and .script != "spread_monitor")' logs/collectors_*.log
 
-# Stats from one collector
-jq 'select(.script == "binance_spot" and .event == "stats")' logs/collectors.log
+# Spread monitor stats
+jq 'select(.script == "spread_monitor" and .event == "stats")' logs/collectors_*.log
 
-# All disconnection events
-jq 'select(.event == "disconnected")' logs/collectors.log
+# All disconnections
+jq 'select(.event == "disconnected")' logs/collectors_*.log
 
-# Stale key alerts (only when there are stale keys)
-jq 'select(.event == "check" and .stale_count > 0)' logs/collectors.log
+# Stale alerts
+jq 'select(.event == "check" and .stale_count > 0)' logs/collectors_*.log
 
-# Staleness check timing
-jq 'select(.event == "check_complete")' logs/collectors.log
+# All signals from logs
+jq 'select(.event == "signal" or .event == "anomaly")' logs/collectors_*.log
 
-# How long did subscriptions take per collector?
-jq 'select(.event == "subscribed") | {script, subscribe_ms}' logs/collectors.log
+# Time from connect to first message per collector
+jq 'select(.event == "first_message") | {script, ms_since_connected}' logs/collectors_*.log
 
-# How long from connect to first message?
-jq 'select(.event == "first_message") | {script, ms_since_connected}' logs/collectors.log
+# Subscription timing
+jq 'select(.event == "subscribed") | {script, subscribe_ms}' logs/collectors_*.log
 ```
 
 ### Log line structure
 
-Every line is a JSON object:
-
 ```json
 {
-  "ts":     1711234567.123,   // Unix timestamp (float)
-  "lvl":    "INFO",           // INFO | WARN | ERROR
-  "script": "binance_spot",   // which script emitted this
-  "event":  "stats",          // event name
-  // ... event-specific fields
+  "ts":     1711234567.123,
+  "lvl":    "INFO",
+  "script": "spread_monitor",
+  "event":  "signal",
+  "direction": "binance_spot_bybit_futures",
+  "symbol": "BTCUSDT",
+  "spread_pct": 1.42
 }
 ```
 
 ---
 
-## 6. Updating pair lists
+## 6. Reading signals
 
-New coins get listed and delisted regularly. Re-run the dictionary generator to refresh:
+### Signal files
 
-```bash
-# Stop collectors
-pkill -f run_all.py
+| File | Content |
+|------|---------|
+| `signals/signals.jsonl` | Normal signals (spread 1% – 99%) |
+| `signals/signals.csv` | Same, CSV format |
+| `signals/anomalies.jsonl` | Anomalies (spread ≥ 100%) |
+| `signals/anomalies.csv` | Same, CSV format |
 
-# Regenerate dictionaries (~70 seconds)
-cd dictionaries && python3 main.py && cd ..
+Files accumulate across restarts (append mode). The CSV header is written only when the file is first created.
 
-# Restart collectors
-python3 run_all.py > logs/collectors.log
+### CSV format
+
+```
+spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
+binance,bybit,BTCUSDT,67234.10,68189.20,1.4200,1711234567123
+gate,binance,ETHUSDT,3120.50,3152.80,1.0341,1711234601456
 ```
 
-**How often to refresh:** Weekly is sufficient for most use cases. After major exchange announcements (large batches of new listings) re-run immediately.
+- `ts` is Unix time in **milliseconds**
+- `spot_exch` / `fut_exch` are full exchange names (binance, bybit, okx, gate)
+
+### Follow signals live
+
+```bash
+tail -f signals/signals.csv
+tail -f signals/anomalies.csv
+```
+
+### Analyze signals with jq
+
+```bash
+# All signals for a specific symbol
+jq 'select(.symbol == "BTCUSDT")' signals/signals.jsonl
+
+# Signals for a specific direction
+jq 'select(.direction == "binance_spot_bybit_futures")' signals/signals.jsonl
+
+# Top spreads
+jq -s 'sort_by(-.spread_pct) | .[0:10]' signals/signals.jsonl
+
+# Count signals per direction
+jq -r '.direction' signals/signals.jsonl | sort | uniq -c | sort -rn
+```
+
+### What anomalies mean
+
+A spread ≥ 100% almost always means one of:
+- A collector was disconnected and the price in Redis is from hours ago
+- The exchange listed a new token with very different pricing conventions
+- A data quality issue on one side
+
+Anomalies should be **investigated, not traded**. They are separated from normal signals exactly for this reason.
 
 ---
 
-## 7. Stopping the system
+## 7. Updating pair lists
 
-### If running in foreground
-
-Press `Ctrl+C`. The system will:
-1. Send cancel to all tasks
-2. Flush remaining Redis batches
-3. Log `stopped` event
-
-### If running in background
+New coins get listed and delisted regularly. Refresh weekly or after major exchange announcements.
 
 ```bash
 pkill -f run_all.py
+cd dictionaries && python3 main.py && cd ..
+python3 run_all.py
 ```
 
-Or if you saved the PID:
+---
+
+## 8. Stopping the system
+
+### Foreground (Ctrl+C)
+
+The system gracefully:
+1. Cancels all async tasks
+2. Flushes remaining Redis batches
+3. Closes log and signal files
+4. Logs `stopped` event
+
+### Background
 
 ```bash
+pkill -f run_all.py
+# or
 kill $(cat run_all.pid)
 ```
 
 ---
 
-## 8. Querying Redis directly
-
-Connect to Redis via Unix socket:
+## 9. Querying Redis directly
 
 ```bash
 redis-cli -s /var/run/redis/redis.sock
 ```
 
-### Get a specific price
+### Get a price
 
 ```bash
-# Binance Spot BTC/USDT
 redis-cli -s /var/run/redis/redis.sock HGETALL md:bn:s:BTCUSDT
-
-# OKX Futures ETH/USDT
-redis-cli -s /var/run/redis/redis.sock HGETALL md:ok:f:ETHUSDT
+# Output:
+# b  67234.10    ← best bid
+# a  67234.20    ← best ask
+# t  1711234567123  ← exchange timestamp ms
 ```
 
-Output:
-```
-1) "b"
-2) "67234.10"
-3) "a"
-4) "67234.20"
-5) "t"
-6) "1711234567123"
-```
-
-### Count all market data keys
-
-```bash
-redis-cli -s /var/run/redis/redis.sock DBSIZE
-```
-
-### Scan all keys for a specific exchange
-
-```bash
-redis-cli -s /var/run/redis/redis.sock --scan --pattern "md:bn:*"
-```
-
-### Check age of a key
-
-```bash
-# Get timestamp from key
-T=$(redis-cli -s /var/run/redis/redis.sock HGET md:bn:s:BTCUSDT t)
-# Compare to now (in seconds)
-echo "Age: $(($(date +%s%3N) - T)) ms"
-```
-
-### Key naming reference
+### Key naming
 
 ```
 md:{ex}:{mkt}:{symbol}
 
-{ex}:  bn = Binance
-       bb = Bybit
-       ok = OKX
-       gt = Gate.io
+{ex}:  bn=Binance  bb=Bybit  ok=OKX  gt=Gate.io
+{mkt}: s=spot      f=futures
+```
 
-{mkt}: s = spot
-       f = futures
+### Useful commands
+
+```bash
+# Total keys
+redis-cli -s /var/run/redis/redis.sock DBSIZE
+
+# All Binance keys
+redis-cli -s /var/run/redis/redis.sock --scan --pattern "md:bn:*"
+
+# Check data age for a key
+T=$(redis-cli -s /var/run/redis/redis.sock HGET md:bn:s:BTCUSDT t)
+echo "Age: $(( ($(date +%s%3N) - T) / 1000 ))s"
 ```
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 ### Collector shows `CRASHED`
 
-Check the log for the specific error:
-
 ```bash
-jq 'select(.event == "collector_crashed")' logs/collectors.log
+jq 'select(.event == "collector_crashed")' logs/collectors_*.log
 ```
 
 Common causes:
-- Subscribe file missing — re-run `dictionaries/main.py`
-- Redis not running — run `sudo bash setup_redis.sh --check`
-- Network issue — check internet connectivity
+- Subscribe file missing → re-run `dictionaries/main.py`
+- Redis not running → `sudo bash setup_redis.sh --check`
+- Network unreachable → check connectivity
 
 ### All collectors stuck in `connecting`
 
-Network or DNS issue. Test manually:
-
 ```bash
-python3 -c "import websockets, asyncio; asyncio.run(websockets.connect('wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker').__aenter__())" && echo "OK"
+python3 -c "
+import websockets, asyncio
+asyncio.run(websockets.connect('wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker').__aenter__())
+print('OK')
+"
 ```
 
-### `streaming` status but msgs/s = 0
+### `streaming` but msgs/s = 0
 
-This is normal for the first 30 seconds. `msgs/s` is populated from `stats` events which fire every 30 seconds. Wait for the first stats cycle.
+Normal for the first 30 seconds. Stats fire every 30 seconds.
 
-### STALE keys in staleness monitor
+### STALE keys at startup
 
-Some keys being stale at startup is normal — they're from the previous run before collectors restarted. They'll become fresh within seconds as collectors begin writing.
+Normal — they're from the previous run. Collectors will overwrite them within seconds.
 
-If stale count grows over time while collectors show `streaming`, it means a specific exchange is not sending data for those symbols. Check which exchange:
+If stale count grows while collectors show `streaming`:
+```bash
+jq 'select(.event == "check" and .stale_count > 0) | .stale_by_source' logs/collectors_*.log | tail -5
+```
+
+### spread_monitor shows `CRASHED` or no signals
 
 ```bash
-jq 'select(.event == "check" and .stale_count > 0) | .stale_by_source' logs/collectors.log | tail -5
+# Check for errors
+jq 'select(.script == "spread_monitor" and .lvl == "ERROR")' logs/collectors_*.log
+
+# Verify combination files exist
+ls dictionaries/combination/*.txt | wc -l   # should be 12
 ```
+
+### Many anomalies (spread ≥ 100%)
+
+Check if a specific collector is disconnected — its stale prices will produce false spreads:
+```bash
+jq 'select(.event == "anomaly") | {direction, symbol, spread_pct}' logs/collectors_*.log | head -20
+```
+
+If anomalies always involve the same exchange (e.g., `gt` in `fut_ex`), that collector is likely having issues.
 
 ### Redis connection refused
 
 ```bash
 sudo bash setup_redis.sh --check
-# If Redis is down:
-sudo systemctl start redis
+sudo systemctl start redis   # if down
 ```
-
-### OKX shows 0 messages
-
-OKX requires subscriptions to be sent as **text** WebSocket frames (not binary). The collector handles this with `.decode()` on the JSON payload. If you see 0 messages from OKX after subscribing:
-1. Check that the subscribe file exists: `ls dictionaries/subscribe/okx/`
-2. Check for `pong` messages as the first received (indicates binary frames being sent)
-
-### Gate.io futures shows errors
-
-Gate.io futures use a separate endpoint (`fx-ws.gateio.ws`) that requires ping messages with the channel name `futures.ping`. If the regular ping is sent, the connection will be closed.
-
-### `AttributeError: readonly attribute` on startup
-
-Old version of `run_all.py`. Pull the latest version from the repository.
 
 ---
 
-## 10. System health checks
+## 11. System health checks
 
-### Quick health check
+### Quick check
 
 ```bash
-# Redis responding
-redis-cli -s /var/run/redis/redis.sock PING
-
-# Number of keys in Redis
-redis-cli -s /var/run/redis/redis.sock DBSIZE
-
-# Collectors running
-pgrep -f run_all.py && echo "Running" || echo "Not running"
+redis-cli -s /var/run/redis/redis.sock PING       # should return PONG
+redis-cli -s /var/run/redis/redis.sock DBSIZE     # number of price keys
+pgrep -f run_all.py && echo "Running" || echo "Stopped"
+ls -lh signals/signals.csv signals/anomalies.csv  # signal file sizes
 ```
 
 ### Full Redis diagnostics
@@ -445,62 +504,70 @@ pgrep -f run_all.py && echo "Running" || echo "Not running"
 sudo bash setup_redis.sh --check
 ```
 
-Reports:
-- Ping latency
-- Memory usage and fragmentation
-- Connected clients
-- Recent slow commands
-- Eviction statistics
-
-### Check data freshness manually
+### Check data freshness
 
 ```bash
-# Sample 10 random keys and check their age
 redis-cli -s /var/run/redis/redis.sock --scan --pattern "md:*" | head -10 | while read key; do
   T=$(redis-cli -s /var/run/redis/redis.sock HGET "$key" t 2>/dev/null)
-  if [ -n "$T" ]; then
-    AGE=$(( ($(date +%s%3N) - T) / 1000 ))
-    echo "$key  age: ${AGE}s"
-  fi
+  [ -n "$T" ] && echo "$key  $(( ($(date +%s%3N) - T) / 1000 ))s old"
 done
 ```
 
-### Check for errors in the last hour
+### Errors in the last hour
 
 ```bash
 awk -v cutoff="$(date -d '1 hour ago' +%s)" '
   {split($0, a, "\"ts\":"); split(a[2], b, ","); if (b[1]+0 > cutoff) print}
-' logs/collectors.log | jq 'select(.lvl == "WARN" or .lvl == "ERROR")'
+' logs/collectors_*.log | jq 'select(.lvl == "WARN" or .lvl == "ERROR")'
 ```
 
 ---
 
-## Reference
+## 12. Reference
 
-### All run_all.py flags
+### run_all.py flags
 
 ```
 python3 run_all.py [OPTIONS]
 
-Options:
-  --buckets    Enable age-bucket distribution in staleness_monitor logs
-  --no-dash    Disable live dashboard, output JSON logs only
+--buckets    Enable 1-min age buckets in staleness_monitor logs
+--no-dash    No live dashboard, JSON logs only
 ```
 
-### Timing constants (collectors)
+### Collector constants
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `BATCH_SIZE` | 100 | Redis pipeline flush threshold (messages) |
-| `BATCH_TIMEOUT` | 20ms | Redis pipeline flush threshold (time) |
-| `STATS_INTERVAL` | 30s | How often `stats` event is logged |
-| `RECONNECT_DELAY` | 3s | Wait before reconnect after disconnect |
-| `PING_INTERVAL` | 20–25s | Exchange keepalive ping interval |
+| `BATCH_SIZE` | 100 | Redis pipeline flush threshold |
+| `BATCH_TIMEOUT` | 20ms | Redis pipeline flush timeout |
+| `STATS_INTERVAL` | 30s | Stats log frequency |
+| `RECONNECT_DELAY` | 3s | Wait after disconnect |
+| `PING_INTERVAL` | 20–25s | Exchange keepalive |
 
 ### Staleness monitor constants
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `CHECK_INTERVAL` | 60s | How often Redis keys are scanned |
-| `STALE_THRESHOLD` | 300s (5 min) | Age at which a key is considered stale |
+| `CHECK_INTERVAL` | 60s | Scan frequency |
+| `STALE_THRESHOLD` | 300s | Age threshold for stale |
 | `SCAN_COUNT` | 500 | Keys per SCAN iteration |
+
+### Spread monitor constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `POLL_INTERVAL` | 0.3s | Redis scan frequency |
+| `MIN_SPREAD_PCT` | 1.0% | Minimum spread to signal |
+| `ANOMALY_THRESHOLD` | 100.0% | Threshold for anomaly file |
+| `STALE_THRESHOLD` | 300s | Skip pair if data older than this |
+| `COOLDOWN_SEC` | 3500s | Silence per (direction, symbol) after signal |
+| `STATS_INTERVAL` | 30s | Stats log frequency |
+
+### Log rotation
+
+| Setting | Value |
+|---------|-------|
+| Chunk size | 12 hours |
+| Max chunks kept | 2 (last 24 hours) |
+| File pattern | `logs/collectors_YYYY-MM-DD_HH-MM.log` |
+| Rotation trigger | Elapsed time (checked each write) |
