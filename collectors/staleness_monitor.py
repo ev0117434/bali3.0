@@ -114,18 +114,25 @@ def build_buckets(ages_sec: list[float]) -> dict:
 
 # ── main check ────────────────────────────────────────────────────────────────
 
-async def check(r: aioredis.Redis, with_buckets: bool) -> None:
-    t0 = time.monotonic()
+async def check(r: aioredis.Redis, with_buckets: bool, cycle: int = 0) -> None:
+    t_check = time.monotonic()
     now_ms = int(time.time() * 1000)
+    log("INFO", "check_start", cycle=cycle, pattern=KEY_PATTERN)
 
+    t_scan = time.monotonic()
     keys = await scan_all_keys(r)
+    scan_ms = round((time.monotonic() - t_scan) * 1000, 1)
+    log("INFO", "scan_complete", cycle=cycle, keys_found=len(keys), scan_ms=scan_ms)
+
     if not keys:
-        log("WARN", "check", total_keys=0, stale_count=0,
+        log("WARN", "check", cycle=cycle, total_keys=0, stale_count=0,
             msg="No md:* keys found in Redis")
         return
 
+    t_fetch = time.monotonic()
     ts_map = await fetch_timestamps(r, keys)
-    scan_ms = round((time.monotonic() - t0) * 1000, 1)
+    fetch_ms = round((time.monotonic() - t_fetch) * 1000, 1)
+    log("INFO", "fetch_complete", cycle=cycle, keys_fetched=len(ts_map), fetch_ms=fetch_ms)
 
     stale_keys = []
     ages_sec = []
@@ -176,10 +183,14 @@ async def check(r: aioredis.Redis, with_buckets: bool) -> None:
         avg_age = round(sum(ages_sec) / len(ages_sec), 1)
         max_age = round(max(ages_sec), 1)
         log("INFO", "buckets",
+            cycle=cycle,
             total_keys=len(ages_sec),
             avg_age_sec=avg_age,
             max_age_sec=max_age,
             distribution=buckets)
+
+    total_ms = round((time.monotonic() - t_check) * 1000, 1)
+    log("INFO", "check_complete", cycle=cycle, total_ms=total_ms)
 
 
 # ── run loop ──────────────────────────────────────────────────────────────────
@@ -193,11 +204,13 @@ async def main(with_buckets: bool) -> None:
     r = aioredis.Redis(unix_socket_path=REDIS_SOCK, decode_responses=False, max_connections=2)
     log("INFO", "redis_connected", socket=REDIS_SOCK)
 
+    cycle = 0
     while True:
+        cycle += 1
         try:
-            await check(r, with_buckets)
+            await check(r, with_buckets, cycle)
         except Exception as e:
-            log("ERROR", "check_failed", reason=str(e)[:200])
+            log("ERROR", "check_failed", cycle=cycle, reason=str(e)[:200])
         await asyncio.sleep(CHECK_INTERVAL)
 
 

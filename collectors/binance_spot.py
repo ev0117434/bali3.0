@@ -85,7 +85,10 @@ async def collect_chunk(r: aioredis.Redis, syms: list[str], counters: dict) -> N
                 close_timeout=5,
                 max_queue=4096,
             ) as ws:
-                log("INFO", "connected", chunk_symbols=len(syms))
+                t_connected = time.monotonic()
+                log("INFO", "connected", chunk_symbols=len(syms), subscribe_ms=0.0,
+                    note="streams_embedded_in_url")
+                first_msg_logged = False
                 async for raw in ws:
                     now = time.monotonic()
                     try:
@@ -101,6 +104,12 @@ async def collect_chunk(r: aioredis.Redis, syms: list[str], counters: dict) -> N
                                 {b"b": bid.encode(), b"a": ask.encode(), b"t": ts_ms},
                             ))
                             counters["msgs"] += 1
+                            if not first_msg_logged:
+                                log("INFO", "first_message",
+                                    chunk_symbols=len(syms),
+                                    ms_since_connected=round((now - t_connected) * 1000, 1),
+                                    first_sym=sym)
+                                first_msg_logged = True
                     except Exception:
                         pass
                     if len(batch) >= BATCH_SIZE or (batch and now - last_flush >= BATCH_TIMEOUT):

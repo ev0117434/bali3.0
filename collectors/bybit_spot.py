@@ -86,7 +86,8 @@ async def ping_loop(ws, stop: asyncio.Event) -> None:
 
 # ── recv loop ─────────────────────────────────────────────────────────────────
 
-async def recv_loop(ws, r: aioredis.Redis, counters: dict, stop: asyncio.Event) -> None:
+async def recv_loop(ws, r: aioredis.Redis, counters: dict, stop: asyncio.Event,
+                    t_connected: float, first_logged: list) -> None:
     batch: list = []
     last_flush = time.monotonic()
     try:
@@ -114,6 +115,11 @@ async def recv_loop(ws, r: aioredis.Redis, counters: dict, stop: asyncio.Event) 
                 if len(fields) > 1:   # at least one price field
                     batch.append((redis_key(sym), fields))
                     counters["msgs"] += 1
+                    if not first_logged[0]:
+                        log("INFO", "first_message",
+                            ms_since_connected=round((now - t_connected) * 1000, 1),
+                            first_sym=sym)
+                        first_logged[0] = True
             except Exception:
                 pass
             if len(batch) >= BATCH_SIZE or (batch and now - last_flush >= BATCH_TIMEOUT):
@@ -146,15 +152,19 @@ async def collect(r: aioredis.Redis, syms: list[str], counters: dict) -> None:
                 close_timeout=5,
                 max_queue=4096,
             ) as ws:
+                t_connected = time.monotonic()
                 log("INFO", "connected")
                 # send subscriptions in batches
+                t_sub = time.monotonic()
                 for i, batch in enumerate(batches):
                     args = [f"orderbook.1.{s}" for s in batch]
                     await ws.send(orjson.dumps({"op": "subscribe", "args": args}))
                     await asyncio.sleep(0.02)
-                log("INFO", "subscribed", sub_batches=len(batches), total_symbols=len(syms))
+                log("INFO", "subscribed", sub_batches=len(batches), total_symbols=len(syms),
+                    subscribe_ms=round((time.monotonic() - t_sub) * 1000, 1))
 
-                recv_task = asyncio.create_task(recv_loop(ws, r, counters, stop))
+                first_logged = [False]
+                recv_task = asyncio.create_task(recv_loop(ws, r, counters, stop, t_connected, first_logged))
                 ping_task = asyncio.create_task(ping_loop(ws, stop))
                 done, pending = await asyncio.wait(
                     [recv_task, ping_task],

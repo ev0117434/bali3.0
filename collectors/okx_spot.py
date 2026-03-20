@@ -124,16 +124,20 @@ async def collect_chunk(
                 close_timeout=5,
                 max_queue=4096,
             ) as ws:
+                t_connected = time.monotonic()
                 log("INFO", "connected", chunk_symbols=len(inst_ids))
                 sub_batches = chunk(inst_ids, SUB_BATCH)
+                t_sub = time.monotonic()
                 for sb in sub_batches:
                     args = [{"channel": "tickers", "instId": iid} for iid in sb]
                     # OKX requires text frames (str), not binary (bytes)
                     await ws.send(orjson.dumps({"op": "subscribe", "args": args}).decode())
                     await asyncio.sleep(0.05)
-                log("INFO", "subscribed", chunk_symbols=len(inst_ids), sub_batches=len(sub_batches))
+                log("INFO", "subscribed", chunk_symbols=len(inst_ids), sub_batches=len(sub_batches),
+                    subscribe_ms=round((time.monotonic() - t_sub) * 1000, 1))
 
                 ping_task = asyncio.create_task(ping_loop(ws, stop))
+                first_msg_logged = False
 
                 async for raw in ws:
                     if raw == "pong":
@@ -157,6 +161,12 @@ async def collect_chunk(
                                     {b"b": bid.encode(), b"a": ask.encode(), b"t": ts_ms},
                                 ))
                                 counters["msgs"] += 1
+                                if not first_msg_logged:
+                                    log("INFO", "first_message",
+                                        chunk_symbols=len(inst_ids),
+                                        ms_since_connected=round((now - t_connected) * 1000, 1),
+                                        first_sym=sym)
+                                    first_msg_logged = True
                     except Exception:
                         pass
                     if len(batch) >= BATCH_SIZE or (batch and now - last_flush >= BATCH_TIMEOUT):
