@@ -43,7 +43,7 @@ COLLECTORS = [
     "gate_futures",
 ]
 
-ALL_SCRIPTS  = COLLECTORS + ["staleness_monitor"]
+ALL_SCRIPTS  = COLLECTORS + ["staleness_monitor", "spread_monitor"]
 REDIS_SOCK   = "/var/run/redis/redis.sock"
 LOG_DIR      = Path(__file__).parent / "logs"
 CHUNK_HOURS  = 12
@@ -187,6 +187,17 @@ class LogInterceptor:
         elif event == "check_failed":
             s["status"] = "check_err"
             s["errors"] += 1
+        elif event == "directions_loaded":
+            s["status"] = "scanning"
+        elif event == "signal":
+            s["msgs_total"] += 1
+        elif event == "stats" and script == "spread_monitor":
+            s["msgs_total"]   = rec.get("signals_total",        s["msgs_total"])
+            s["msgs_per_sec"] = rec.get("signals_per_interval", s["msgs_per_sec"])
+            s["flushes"]      = rec.get("cooldowns_active",     s["flushes"])
+            s["avg_pipe_ms"]  = rec.get("last_cycle_ms",        s["avg_pipe_ms"])
+        elif event == "cycle_error":
+            s["errors"] += 1
 
 
 # ── dashboard ─────────────────────────────────────────────────────────────────
@@ -265,6 +276,19 @@ def build_table(state: dict, uptime: float, log_file: str) -> Table:
         str(sm["errors"]) if sm["errors"] == 0 else f"[red]{sm['errors']}[/red]",
         f"{now - sm['last_ts']:.0f}s",
     )
+
+    t.add_section()
+    sp = state["spread_monitor"]
+    t.add_row(
+        "spread_monitor",
+        _status_text(sp),
+        str(sp["msgs_per_sec"]),                          # signals per 30s interval
+        f"{sp['msgs_total']:,}",                          # total signals
+        f"cd:{sp['flushes']}",                            # cooldowns active
+        f"{sp['avg_pipe_ms']:.2f}",                       # last cycle ms
+        str(sp["errors"]) if sp["errors"] == 0 else f"[red]{sp['errors']}[/red]",
+        f"{now - sp['last_ts']:.0f}s",
+    )
     return t
 
 
@@ -337,6 +361,10 @@ async def main(with_buckets: bool = False, no_dash: bool = False) -> None:
     staleness = importlib.import_module("staleness_monitor")
     tasks.append(asyncio.create_task(staleness.main(with_buckets)))
     log("INFO", "collector_started", collector="staleness_monitor")
+
+    spread = importlib.import_module("spread_monitor")
+    tasks.append(asyncio.create_task(spread.main()))
+    log("INFO", "collector_started", collector="spread_monitor")
 
     start   = time.time()
     console = Console(stderr=True, force_terminal=sys.stderr.isatty())
