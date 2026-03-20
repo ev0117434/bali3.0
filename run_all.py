@@ -3,25 +3,30 @@
 """
 run_all.py — запускает все 8 WS-коллекторов + staleness_monitor в одном процессе.
 
-Каждый коллектор работает как отдельная asyncio-задача.
-JSON-логи идут в stdout, живой дашборд метрик — в stderr.
+При старте:
+  1. Очищает Redis (FLUSHDB)
+  2. Запускает ротируемый лог-файл (чанки по 12 часов, хранится 2 последних)
+  3. Запускает все коллекторы + staleness_monitor
+  4. Рисует live-дашборд в stderr
+
+Лог-файлы: logs/collectors_YYYY-MM-DD_HH-MM.log (автоматически, без редиректа)
 
 Запуск:
     python3 run_all.py
-    python3 run_all.py --buckets         # staleness с корзинами
-    python3 run_all.py --no-dash          # только JSON-логи без TUI
-    python3 run_all.py 2>&1 | tee logs/collectors.log
+    python3 run_all.py --buckets    # staleness с корзинами
+    python3 run_all.py --no-dash    # только JSON-логи без TUI
 """
 
 import argparse
 import asyncio
 import importlib
-import io
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import orjson
+import redis.asyncio as aioredis
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
@@ -38,9 +43,51 @@ COLLECTORS = [
     "gate_futures",
 ]
 
-ALL_SCRIPTS = COLLECTORS + ["staleness_monitor"]
+ALL_SCRIPTS  = COLLECTORS + ["staleness_monitor"]
+REDIS_SOCK   = "/var/run/redis/redis.sock"
+LOG_DIR      = Path(__file__).parent / "logs"
+CHUNK_HOURS  = 12
+MAX_CHUNKS   = 2
 
 sys.path.insert(0, str(Path(__file__).parent / "collectors"))
+
+
+# ── rotating log writer ───────────────────────────────────────────────────────
+
+class RotatingLogWriter:
+    """Writes bytes to time-based log chunks. Keeps MAX_CHUNKS files, deletes oldest."""
+
+    def __init__(self, log_dir: Path, chunk_hours: int, max_chunks: int) -> None:
+        self._dir        = log_dir
+        self._chunk_sec  = chunk_hours * 3600
+        self._max_chunks = max_chunks
+        self._file       = None
+        self._chunk_start = 0.0
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self._rotate()
+
+    def _rotate(self) -> None:
+        if self._file:
+            self._file.close()
+        fname        = f"collectors_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.log"
+        self._file   = open(self._dir / fname, "ab")
+        self._chunk_start = time.monotonic()
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        chunks = sorted(self._dir.glob("collectors_*.log"))
+        for old in chunks[: max(0, len(chunks) - self._max_chunks)]:
+            old.unlink(missing_ok=True)
+
+    def write(self, data: bytes) -> None:
+        if time.monotonic() - self._chunk_start >= self._chunk_sec:
+            self._rotate()
+        self._file.write(data)
+        self._file.flush()
+
+    def close(self) -> None:
+        if self._file:
+            self._file.close()
 
 
 # ── per-script state ──────────────────────────────────────────────────────────
@@ -65,14 +112,20 @@ def make_state() -> dict:
 # ── stdout interceptor ────────────────────────────────────────────────────────
 
 class LogInterceptor:
-    """Forwards all bytes to real stdout; parses JSON lines to update dashboard state."""
+    """
+    Replaces sys.stdout. All collectors call sys.stdout.buffer.write().
+    This interceptor:
+      - Writes bytes to the rotating log file
+      - Writes bytes to the original stdout (for --no-dash pipe support)
+      - Parses JSON lines to update the dashboard state
+    """
 
-    def __init__(self, real_buf, state: dict) -> None:
-        self._buf     = real_buf
-        self._state   = state
-        self._partial = b""
+    def __init__(self, real_buf, state: dict, log_writer: RotatingLogWriter) -> None:
+        self._buf        = real_buf
+        self._state      = state
+        self._log_writer = log_writer
+        self._partial    = b""
 
-    # Allow sys.stdout.buffer to be used as a drop-in buffer object
     @property
     def buffer(self):
         return self
@@ -80,6 +133,8 @@ class LogInterceptor:
     def write(self, data: bytes) -> int:
         self._buf.write(data)
         self._buf.flush()
+        self._log_writer.write(data)
+
         combined      = self._partial + data
         lines         = combined.split(b"\n")
         self._partial = lines[-1]
@@ -126,10 +181,7 @@ class LogInterceptor:
         elif event == "check":
             s["total_keys"]  = rec.get("total_keys",  s["total_keys"])
             s["stale_count"] = rec.get("stale_count", s["stale_count"])
-            if s["stale_count"] > 0:
-                s["status"] = f"STALE:{s['stale_count']}"
-            else:
-                s["status"] = "ok"
+            s["status"]      = f"STALE:{s['stale_count']}" if s["stale_count"] > 0 else "ok"
         elif event == "check_start":
             s["status"] = "checking"
         elif event == "check_failed":
@@ -162,28 +214,30 @@ def _status_text(s: dict) -> Text:
     return Text(status, style=style)
 
 
-def build_table(state: dict, uptime: float) -> Table:
+def build_table(state: dict, uptime: float, log_file: str) -> Table:
     t = Table(
-        title=f"[bold cyan]Bali 3.0[/bold cyan]  uptime [yellow]{int(uptime)}s[/yellow]",
+        title=(
+            f"[bold cyan]Bali 3.0[/bold cyan]  "
+            f"uptime [yellow]{int(uptime)}s[/yellow]  "
+            f"log [dim]{log_file}[/dim]"
+        ),
         show_header=True,
         header_style="bold",
         border_style="bright_black",
         expand=True,
     )
-    t.add_column("Script",     style="bold white", min_width=18)
-    t.add_column("Status",     min_width=13)
-    t.add_column("msgs/s",     justify="right", min_width=8)
-    t.add_column("total",      justify="right", min_width=11)
-    t.add_column("flushes",    justify="right", min_width=8)
-    t.add_column("pipe ms",    justify="right", min_width=8)
-    t.add_column("errors",     justify="right", min_width=7)
-    t.add_column("last seen",  justify="right", min_width=9)
+    t.add_column("Script",    style="bold white", min_width=18)
+    t.add_column("Status",    min_width=13)
+    t.add_column("msgs/s",    justify="right", min_width=8)
+    t.add_column("total",     justify="right", min_width=11)
+    t.add_column("flushes",   justify="right", min_width=8)
+    t.add_column("pipe ms",   justify="right", min_width=8)
+    t.add_column("errors",    justify="right", min_width=7)
+    t.add_column("last seen", justify="right", min_width=9)
 
     now = time.time()
-
     for script in COLLECTORS:
-        s    = state[script]
-        age  = now - s["last_ts"]
+        s = state[script]
         t.add_row(
             script,
             _status_text(s),
@@ -192,36 +246,33 @@ def build_table(state: dict, uptime: float) -> Table:
             f"{s['flushes']:,}",
             f"{s['avg_pipe_ms']:.3f}",
             str(s["errors"]) if s["errors"] == 0 else f"[red]{s['errors']}[/red]",
-            f"{age:.0f}s",
+            f"{now - s['last_ts']:.0f}s",
         )
 
-    # separator before staleness row
     t.add_section()
-    sm = state["staleness_monitor"]
-    sm_age = now - sm["last_ts"]
+    sm  = state["staleness_monitor"]
     stale_str = (
         f"[red bold]{sm['stale_count']}[/red bold]"
-        if sm["stale_count"] > 0
-        else str(sm["stale_count"])
+        if sm["stale_count"] > 0 else str(sm["stale_count"])
     )
     t.add_row(
         "staleness_monitor",
         _status_text(sm),
         "—",
-        f"{sm['total_keys']:,}",   # Redis keys tracked
+        f"{sm['total_keys']:,}",
         f"stale:{stale_str}",
         "—",
         str(sm["errors"]) if sm["errors"] == 0 else f"[red]{sm['errors']}[/red]",
-        f"{sm_age:.0f}s",
+        f"{now - sm['last_ts']:.0f}s",
     )
-
     return t
 
 
-async def dashboard_loop(state: dict, live: Live, start: float) -> None:
+async def dashboard_loop(state: dict, live: Live, start: float, log_writer: RotatingLogWriter) -> None:
     while True:
         await asyncio.sleep(2)
-        live.update(build_table(state, time.time() - start))
+        log_file = Path(log_writer._file.name).name if log_writer._file else ""
+        live.update(build_table(state, time.time() - start, log_file))
 
 
 # ── logger ────────────────────────────────────────────────────────────────────
@@ -232,7 +283,29 @@ def log(lvl: str, event: str, **kw) -> None:
     sys.stdout.buffer.flush()
 
 
-# ── runner ────────────────────────────────────────────────────────────────────
+# ── Redis flush ───────────────────────────────────────────────────────────────
+
+async def flush_redis() -> None:
+    """FLUSHDB is disabled in config — use SCAN + DEL to clear all keys."""
+    r = aioredis.Redis(unix_socket_path=REDIS_SOCK, decode_responses=False)
+    try:
+        cursor  = 0
+        deleted = 0
+        while True:
+            cursor, keys = await r.scan(cursor, count=500)
+            if keys:
+                await r.delete(*keys)
+                deleted += len(keys)
+            if cursor == 0:
+                break
+        log("INFO", "redis_flushed", deleted_keys=deleted, socket=REDIS_SOCK)
+    except Exception as e:
+        log("WARN", "redis_flush_failed", reason=str(e))
+    finally:
+        await r.aclose()
+
+
+# ── collector runner ──────────────────────────────────────────────────────────
 
 async def run_collector(name: str) -> None:
     mod = importlib.import_module(name)
@@ -243,17 +316,21 @@ async def run_collector(name: str) -> None:
         log("ERROR", "collector_crashed", collector=name, reason=str(e))
 
 
+# ── main ──────────────────────────────────────────────────────────────────────
+
 async def main(with_buckets: bool = False, no_dash: bool = False) -> None:
-    state    = make_state()
-    real_buf = sys.stdout.buffer
+    state      = make_state()
+    real_buf   = sys.stdout.buffer
+    log_writer = RotatingLogWriter(LOG_DIR, CHUNK_HOURS, MAX_CHUNKS)
 
-    # Replace sys.stdout with a wrapper whose .buffer is our interceptor.
-    # Collectors call sys.stdout.buffer.write() — this routes through LogInterceptor.
-    if not no_dash:
-        interceptor  = LogInterceptor(real_buf, state)
-        sys.stdout   = interceptor  # type: ignore
+    interceptor  = LogInterceptor(real_buf, state, log_writer)
+    sys.stdout   = interceptor  # type: ignore
 
-    log("INFO", "startup", collectors=COLLECTORS, staleness_buckets=with_buckets)
+    log("INFO", "startup", collectors=COLLECTORS, staleness_buckets=with_buckets,
+        log_dir=str(LOG_DIR), chunk_hours=CHUNK_HOURS, max_chunks=MAX_CHUNKS)
+
+    # Flush Redis before starting collectors
+    await flush_redis()
 
     tasks = [asyncio.create_task(run_collector(name)) for name in COLLECTORS]
 
@@ -261,56 +338,45 @@ async def main(with_buckets: bool = False, no_dash: bool = False) -> None:
     tasks.append(asyncio.create_task(staleness.main(with_buckets)))
     log("INFO", "collector_started", collector="staleness_monitor")
 
-    console = Console(stderr=True, force_terminal=sys.stderr.isatty())
     start   = time.time()
+    console = Console(stderr=True, force_terminal=sys.stderr.isatty())
 
-    async def _gather():
-        try:
-            await asyncio.gather(*tasks)
-        except KeyboardInterrupt:
-            pass
+    async def _shutdown():
+        log("INFO", "shutdown", msg="KeyboardInterrupt received")
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        log("INFO", "stopped")
+        log_writer.close()
 
     if no_dash:
         try:
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
-            log("INFO", "shutdown", msg="KeyboardInterrupt received")
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            log("INFO", "stopped")
+            await _shutdown()
         return
 
+    log_file = Path(log_writer._file.name).name
     with Live(
-        build_table(state, 0),
+        build_table(state, 0, log_file),
         console=console,
         refresh_per_second=1,
         screen=False,
         transient=False,
     ) as live:
-        tasks.append(asyncio.create_task(dashboard_loop(state, live, start)))
+        tasks.append(asyncio.create_task(dashboard_loop(state, live, start, log_writer)))
         try:
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
-            log("INFO", "shutdown", msg="KeyboardInterrupt received")
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            log("INFO", "stopped")
+            await _shutdown()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run all market data collectors")
-    parser.add_argument(
-        "--buckets",
-        action="store_true",
-        help="Enable age-bucket distribution in staleness_monitor",
-    )
-    parser.add_argument(
-        "--no-dash",
-        action="store_true",
-        help="Disable live dashboard, output raw JSON logs only",
-    )
+    parser.add_argument("--buckets",  action="store_true",
+                        help="Enable age-bucket distribution in staleness_monitor")
+    parser.add_argument("--no-dash",  action="store_true",
+                        help="Disable live dashboard, output JSON logs only")
     args = parser.parse_args()
 
     try:
