@@ -11,11 +11,11 @@ Real-time market data collection and spread monitoring system for cryptocurrency
 | **Dictionary Generator** | Discovers active trading pairs via REST + WebSocket validation | ~70 seconds, run on demand |
 | **Collectors** (×8) | Streams real-time bid/ask from WebSocket feeds into Redis | Continuous |
 | **Staleness Monitor** | Checks Redis key freshness every 60s, alerts on stale data | Continuous |
-| **Spread Monitor** | Scans 12 spot→futures directions every 0.3s, writes signals | Continuous |
+| **Spread Monitor** | Scans 12 spot→futures directions every 0.3s, writes signals + snapshots | Continuous |
 
 **Exchanges:** Binance · Bybit · OKX · Gate.io
 **Markets:** Spot + Futures (USDT/USDC perpetuals) for each exchange
-**Redis keys:** `md:{exchange}:{market}:{symbol}` → `{b: bid, a: ask, t: timestamp_ms}`
+**Redis keys (current):** `md:{ex}:{mkt}:{sym}` → HASH `{b, a, t}` · `md:hist:{ex}:{mkt}:{sym}:{chunk_id}` → ZSET history
 
 ---
 
@@ -141,7 +141,14 @@ bali3.0/
 │       ├── okx/{spot,futures}.txt
 │       └── gate/{spot,futures}.txt
 │
+├── signals/
+│   ├── signals.jsonl / signals.csv      # Normal signals (spread 1%–99%)
+│   ├── anomalies.jsonl / anomalies.csv  # Anomalies (spread ≥100%)
+│   └── snapshots/YYYY-MM-DD/HH/        # Per-signal spread history, 3500s window
+│       └── {spot}_{fut}_{sym}_{ts}.csv  # history rows + live rows at 0.3s
+│
 └── collectors/
+    ├── hist_writer.py       # Shared history module (20-min chunks, ZSET, 1 sample/sec)
     ├── binance_spot.py
     ├── binance_futures.py
     ├── bybit_spot.py
@@ -188,24 +195,30 @@ When a 3rd chunk would be created, the oldest is deleted. Always 2 files maximum
 ### Redis key schema
 
 ```
-md:{exchange}:{market}:{symbol}   →   HASH
+md:{ex}:{mkt}:{symbol}                 →   HASH   (current price)
+md:hist:{ex}:{mkt}:{symbol}:{chunk_id} →   ZSET   (1-hour history, 20-min chunks)
+md:hist:config                         →   STRING  (JSON, active chunk metadata)
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `b` | string | Best bid price |
-| `a` | string | Best ask price |
-| `t` | string | Exchange timestamp (ms) |
+**HASH fields:** `b` = best bid · `a` = best ask · `t` = timestamp ms
+
+**ZSET member format:** `{bid}|{ask}|{ts_ms}` · **score:** `ts_ms`
 
 **Exchange codes:** `bn` = Binance · `bb` = Bybit · `ok` = OKX · `gt` = Gate.io
 **Market codes:** `s` = spot · `f` = futures
 
 **Examples:**
 ```
-md:bn:s:BTCUSDT    → Binance Spot BTC/USDT
-md:ok:f:BTCUSDT    → OKX Futures BTC/USDT (SWAP)
-md:gt:s:ETHUSDT    → Gate.io Spot ETH/USDT
+md:bn:s:BTCUSDT              → Binance Spot BTC/USDT (current)
+md:hist:bn:s:BTCUSDT:1450782 → Binance Spot BTC/USDT history chunk 1450782
+md:ok:f:BTCUSDT              → OKX Futures BTC/USDT (current)
 ```
+
+### History (hist_writer.py)
+
+`chunk_id = int(unix_sec // 1200)` — identical across all collectors, no coordination needed. Each collector writes max 1 sample/sec per symbol. Four chunks kept at once (~80 min). When the 5th chunk starts, the 1st is deleted. All writes happen inside the collector's existing pipeline batch — no extra round-trips.
+
+On signal fire, `spread_monitor` prepends the last hour of history to the snapshot CSV by reading all 4 chunks in a single pipeline call.
 
 ### WebSocket protocol details
 
@@ -312,6 +325,10 @@ binance,bybit,BTCUSDT,67234.10,68189.20,1.4200,1711234567123
 ```
 
 Both files open in append mode — signals accumulate across restarts. The CSV header is written only if the file is empty.
+
+### Snapshots
+
+On every signal, a snapshot CSV is opened at `signals/snapshots/YYYY-MM-DD/HH/{spot}_{fut}_{sym}_{ts}.csv`. It starts with up to 3600 historical rows (last 1 hour, matched by second bucket from `md:hist:*` keys), then appends live rows at 0.3s intervals for the full 3500s cooldown window. Rows are written even when spread drops below `MIN_SPREAD_PCT`.
 
 ### Cooldown
 

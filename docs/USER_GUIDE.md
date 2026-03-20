@@ -12,12 +12,14 @@ Step-by-step instructions for setting up, running, and maintaining the system fr
 4. [Reading the dashboard](#4-reading-the-dashboard)
 5. [Reading logs](#5-reading-logs)
 6. [Reading signals](#6-reading-signals)
-7. [Updating pair lists](#7-updating-pair-lists)
-8. [Stopping the system](#8-stopping-the-system)
-9. [Querying Redis directly](#9-querying-redis-directly)
-10. [Troubleshooting](#10-troubleshooting)
-11. [System health checks](#11-system-health-checks)
-12. [Reference](#12-reference)
+7. [Snapshots](#7-snapshots)
+8. [Querying price history](#8-querying-price-history)
+9. [Updating pair lists](#9-updating-pair-lists)
+10. [Stopping the system](#10-stopping-the-system)
+11. [Querying Redis directly](#11-querying-redis-directly)
+12. [Troubleshooting](#12-troubleshooting)
+13. [System health checks](#13-system-health-checks)
+14. [Reference](#14-reference)
 
 ---
 
@@ -350,7 +352,118 @@ Anomalies should be **investigated, not traded**. They are separated from normal
 
 ---
 
-## 7. Updating pair lists
+## 7. Snapshots
+
+When a signal fires, `spread_monitor` automatically opens a **snapshot CSV** that records the spread between that spot and futures pair every 0.3 seconds for the full 3500-second cooldown window. This captures the complete evolution of the spread after the signal.
+
+### File location
+
+```
+signals/snapshots/
+  YYYY-MM-DD/
+    HH/
+      {spot}_{fut}_{symbol}_{YYYYMMDD_HHMMSS}.csv
+```
+
+Directory is bucketed by **UTC day and hour of the signal**. Example:
+
+```
+signals/snapshots/2026-03-20/14/binance_bybit_BTCUSDT_20260320_143022.csv
+```
+
+### Snapshot CSV format
+
+```
+spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
+binance,bybit,BTCUSDT,67234.10,68189.20,1.4200,1711234567123   ← history rows
+binance,bybit,BTCUSDT,67235.00,68190.50,1.4199,1711234568123   ← ...up to 3600 rows
+binance,bybit,BTCUSDT,67236.20,68191.00,1.4187,1711238067123   ← live rows (0.3s interval)
+```
+
+The file starts with **up to 3600 historical rows** (the last 1 hour of bid/ask data, sampled at 1/sec), then continues with live rows every 0.3 seconds. This means the snapshot is immediately useful even for the first signal after startup, as soon as an hour of history has been collected.
+
+- `ts` is Unix time in **milliseconds**
+- `spread_pct` = `(futures_bid - spot_ask) / spot_ask × 100`, rounded to 4 decimal places
+- Rows are written even when spread drops below `MIN_SPREAD_PCT` — the full evolution is captured
+- File is appended to; never re-opened after initial write
+- File is closed automatically when the 3500s window expires
+
+### Follow a snapshot live
+
+```bash
+# List recent snapshot files
+find signals/snapshots -name "*.csv" -newer signals/signals.csv | sort
+
+# Follow a specific snapshot
+tail -f signals/snapshots/2026-03-20/14/binance_bybit_BTCUSDT_20260320_143022.csv
+```
+
+### Spread monitor log events for snapshots
+
+| Event | Level | Key fields |
+|-------|-------|------------|
+| `snapshot_opened` | INFO | `direction`, `symbol`, `file`, `duration_sec` |
+| `snapshot_history_written` | INFO | `direction`, `symbol`, `rows` |
+
+---
+
+## 8. Querying price history
+
+All collectors write 1 sample per second per symbol to Redis ZSETs in 20-minute chunks. This provides up to ~80 minutes of history at any time (always covers the last hour).
+
+### Key scheme
+
+```
+md:hist:{ex}:{mkt}:{symbol}:{chunk_id}   →   ZSET
+  score:  ts_ms (integer milliseconds)
+  member: {bid}|{ask}|{ts_ms}
+```
+
+`chunk_id = int(unix_seconds // 1200)` — changes every 20 minutes. Four chunks are kept at any time. The oldest chunk is deleted when the fifth starts.
+
+### Config key
+
+```bash
+redis-cli -s /var/run/redis/redis.sock GET md:hist:config | python3 -m json.tool
+```
+
+Output:
+```json
+{
+  "chunk_sec": 1200,
+  "max_chunks": 4,
+  "sample_sec": 1,
+  "active_chunk_id": 1450782,
+  "chunks": [
+    {"id": 1450779, "start_ms": 1741234800000, "end_ms": 1741236000000, "active": false},
+    {"id": 1450780, "start_ms": 1741236000000, "end_ms": 1741237200000, "active": false},
+    {"id": 1450781, "start_ms": 1741237200000, "end_ms": 1741238400000, "active": false},
+    {"id": 1450782, "start_ms": 1741238400000, "end_ms": 1741239600000, "active": true}
+  ]
+}
+```
+
+### Query last hour for a symbol
+
+```bash
+# Get current chunk_id
+CID=$(python3 -c "import time; print(int(time.time()//1200))")
+
+# Read last hour from all 4 chunks, pipe format: bid|ask|ts_ms
+for i in 3 2 1 0; do
+  redis-cli -s /var/run/redis/redis.sock \
+    ZRANGEBYSCORE "md:hist:bn:s:BTCUSDT:$((CID - i))" \
+    "$(($(date +%s%3N) - 3600000))" "+inf"
+done
+```
+
+### Memory estimate
+
+~1 sample/sec × 3600 sec × 4 chunks × 4000 source×symbol pairs × ~50 bytes ≈ **700 MB** peak.
+
+---
+
+## 9. Updating pair lists
 
 New coins get listed and delisted regularly. Refresh weekly or after major exchange announcements.
 
@@ -362,7 +475,7 @@ python3 run_all.py
 
 ---
 
-## 8. Stopping the system
+## 10. Stopping the system
 
 ### Foreground (Ctrl+C)
 
@@ -382,7 +495,7 @@ kill $(cat run_all.pid)
 
 ---
 
-## 9. Querying Redis directly
+## 11. Querying Redis directly
 
 ```bash
 redis-cli -s /var/run/redis/redis.sock
@@ -423,7 +536,7 @@ echo "Age: $(( ($(date +%s%3N) - T) / 1000 ))s"
 
 ---
 
-## 10. Troubleshooting
+## 12. Troubleshooting
 
 ### Collector shows `CRASHED`
 
@@ -487,7 +600,7 @@ sudo systemctl start redis   # if down
 
 ---
 
-## 11. System health checks
+## 13. System health checks
 
 ### Quick check
 
@@ -523,7 +636,7 @@ awk -v cutoff="$(date -d '1 hour ago' +%s)" '
 
 ---
 
-## 12. Reference
+## 14. Reference
 
 ### run_all.py flags
 
@@ -560,8 +673,32 @@ python3 run_all.py [OPTIONS]
 | `MIN_SPREAD_PCT` | 1.0% | Minimum spread to signal |
 | `ANOMALY_THRESHOLD` | 100.0% | Threshold for anomaly file |
 | `STALE_THRESHOLD` | 300s | Skip pair if data older than this |
-| `COOLDOWN_SEC` | 3500s | Silence per (direction, symbol) after signal |
+| `COOLDOWN_SEC` | 3500s | Silence per (direction, symbol) after signal; also = snapshot window duration |
 | `STATS_INTERVAL` | 30s | Stats log frequency |
+
+### Spread monitor log events (full list)
+
+| Event | Level | Key fields |
+|-------|-------|-----------|
+| `startup` | INFO | `poll_interval_sec`, `min_spread_pct`, `cooldown_sec` |
+| `directions_loaded` | INFO | `directions`, `total_symbols` |
+| `redis_connected` | INFO | `socket` |
+| `signal_files_opened` | INFO | paths, `anomaly_threshold_pct` |
+| `signal` | INFO | `direction`, `symbol`, `spread_pct`, `spot_ask`, `fut_bid`, `cooldown_until` |
+| `anomaly` | INFO | same as `signal` |
+| `snapshot_opened` | INFO | `direction`, `symbol`, `file`, `duration_sec` |
+| `snapshot_history_written` | INFO | `direction`, `symbol`, `rows` |
+| `stats` | INFO | `signals_total`, `anomalies_total`, `cooldowns_active`, `snapshots_active`, `last_cycle_ms` |
+| `cycle_error` | ERROR | `reason` |
+
+### History writer constants (hist_writer.py)
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `CHUNK_SEC` | 1200s | 20-minute chunk duration |
+| `MAX_CHUNKS` | 4 | Chunks kept at once (80 min window) |
+| `SAMPLE_SEC` | 1s | Max write rate per symbol |
+| `CONFIG_KEY` | `md:hist:config` | Global config key in Redis |
 
 ### Log rotation
 
