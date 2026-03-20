@@ -33,6 +33,7 @@ from rich.table import Table
 from rich.text import Text
 
 COLLECTORS = [
+    # ── price / best-bid-ask collectors (md:* keys) ──────────────────────────
     "binance_spot",
     "binance_futures",
     "bybit_spot",
@@ -41,6 +42,15 @@ COLLECTORS = [
     "okx_futures",
     "gate_spot",
     "gate_futures",
+    # ── order-book collectors (ob:* keys, 10 levels) ─────────────────────────
+    "ob_binance_spot",
+    "ob_binance_futures",
+    "ob_bybit_spot",
+    "ob_bybit_futures",
+    "ob_okx_spot",
+    "ob_okx_futures",
+    "ob_gate_spot",
+    "ob_gate_futures",
 ]
 
 ALL_SCRIPTS  = COLLECTORS + ["staleness_monitor", "spread_monitor"]

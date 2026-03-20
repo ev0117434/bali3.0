@@ -13,13 +13,14 @@ Step-by-step instructions for setting up, running, and maintaining the system fr
 5. [Reading logs](#5-reading-logs)
 6. [Reading signals](#6-reading-signals)
 7. [Snapshots](#7-snapshots)
-8. [Querying price history](#8-querying-price-history)
-9. [Updating pair lists](#9-updating-pair-lists)
-10. [Stopping the system](#10-stopping-the-system)
-11. [Querying Redis directly](#11-querying-redis-directly)
-12. [Troubleshooting](#12-troubleshooting)
-13. [System health checks](#13-system-health-checks)
-14. [Reference](#14-reference)
+8. [Querying price history (md collectors)](#8-querying-price-history-md-collectors)
+9. [Querying order book data (ob collectors)](#9-querying-order-book-data-ob-collectors)
+10. [Updating pair lists](#10-updating-pair-lists)
+11. [Stopping the system](#11-stopping-the-system)
+12. [Querying Redis directly](#12-querying-redis-directly)
+13. [Troubleshooting](#13-troubleshooting)
+14. [System health checks](#14-system-health-checks)
+15. [Reference](#15-reference)
 
 ---
 
@@ -119,9 +120,10 @@ python3 run_all.py
 What happens on startup:
 1. Redis is flushed (all old keys removed)
 2. A new log file is opened: `logs/collectors_YYYY-MM-DD_HH-MM.log`
-3. All 8 collectors start connecting to their exchanges
-4. `staleness_monitor` and `spread_monitor` start
-5. Live dashboard appears in terminal
+3. All 8 best-price collectors (`binance_spot`, `binance_futures`, `bybit_spot`, `bybit_futures`, `okx_spot`, `okx_futures`, `gate_spot`, `gate_futures`) start connecting
+4. All 8 order book collectors (`ob_binance_spot`, `ob_binance_futures`, `ob_bybit_spot`, `ob_bybit_futures`, `ob_okx_spot`, `ob_okx_futures`, `ob_gate_spot`, `ob_gate_futures`) start connecting
+5. `staleness_monitor` and `spread_monitor` start
+6. Live dashboard appears in terminal
 
 ### Start with staleness age distribution
 
@@ -407,7 +409,7 @@ tail -f signals/snapshots/2026-03-20/14/binance_bybit_BTCUSDT_20260320_143022.cs
 
 ---
 
-## 8. Querying price history
+## 8. Querying price history (md collectors)
 
 All collectors write 1 sample per second per symbol to Redis ZSETs in 20-minute chunks. This provides up to ~80 minutes of history at any time (always covers the last hour).
 
@@ -463,7 +465,150 @@ done
 
 ---
 
-## 9. Updating pair lists
+## 9. Querying order book data (ob collectors)
+
+Eight separate OB collectors (`ob_binance_spot`, `ob_binance_futures`, `ob_bybit_spot`, `ob_bybit_futures`, `ob_okx_spot`, `ob_okx_futures`, `ob_gate_spot`, `ob_gate_futures`) maintain full 10-level order books (bids + asks). Each collector writes to two Redis structures: a current-state HASH and a history ZSET.
+
+### Current order book (HASH)
+
+```
+ob:{ex}:{mkt}:{symbol}    →   HASH (41 fields)
+```
+
+Fields:
+
+| Field | Description |
+|-------|-------------|
+| `b1`..`b10` | Bid prices, level 1 (best) to level 10 |
+| `bq1`..`bq10` | Bid quantities, level 1 to level 10 |
+| `a1`..`a10` | Ask prices, level 1 (best) to level 10 |
+| `aq1`..`aq10` | Ask quantities, level 1 to level 10 |
+| `t` | Exchange timestamp (milliseconds) or local time if exchange doesn't provide it |
+
+Example:
+
+```bash
+redis-cli -s /var/run/redis/redis.sock HGETALL ob:bn:f:BTCUSDT
+# b1  67234.10    bq1  12.500
+# b2  67233.00    bq2   8.200
+# ...
+# a1  67234.20    aq1   9.100
+# ...
+# t   1711234567123
+```
+
+Key naming (`{ex}:{mkt}`):
+
+```
+ob:bn:s  — Binance spot
+ob:bn:f  — Binance futures
+ob:bb:s  — Bybit spot
+ob:bb:f  — Bybit futures
+ob:ok:s  — OKX spot
+ob:ok:f  — OKX futures
+ob:gt:s  — Gate.io spot
+ob:gt:f  — Gate.io futures
+```
+
+### Order book history (ZSET)
+
+```
+ob:hist:{ex}:{mkt}:{sym}:{chunk_id}   →   ZSET
+  score:  ts_ms (integer milliseconds)
+  member: b1|bq1|b2|bq2|...|b10|bq10|a1|aq1|...|a10|aq10|ts_ms
+```
+
+`chunk_id = int(unix_seconds // 1200)` — changes every 20 minutes. Four chunks are kept (80-minute window, always covers the last hour). Writes are throttled to 1 sample per second per symbol.
+
+The member is a pipe-delimited string of 41 values: 10 bid price+qty pairs, then 10 ask price+qty pairs, then the timestamp.
+
+### Config key
+
+```bash
+redis-cli -s /var/run/redis/redis.sock GET ob:hist:config | python3 -m json.tool
+```
+
+Output:
+```json
+{
+  "chunk_sec": 1200,
+  "max_chunks": 4,
+  "sample_sec": 1,
+  "levels": 10,
+  "active_chunk_id": 1450782,
+  "key_pattern": "ob:hist:{ex}:{mkt}:{sym}:{chunk_id}",
+  "member_format": "b1|bq1|b2|bq2|...|b10|bq10|a1|aq1|...|a10|aq10|ts_ms",
+  "sources": ["bn:s","bn:f","bb:s","bb:f","ok:s","ok:f","gt:s","gt:f"],
+  "chunks": [...]
+}
+```
+
+### Query the last hour for a symbol
+
+```bash
+# Get current chunk_id
+CID=$(python3 -c "import time; print(int(time.time()//1200))")
+NOW_MS=$(date +%s%3N)
+SINCE_MS=$((NOW_MS - 3600000))
+
+# Read all 4 chunks and parse in Python
+python3 - <<'EOF'
+import redis, time
+
+r = redis.Redis(unix_socket_path="/var/run/redis/redis.sock")
+cid = int(time.time() // 1200)
+now_ms = int(time.time() * 1000)
+since_ms = now_ms - 3600000
+
+rows = []
+for i in range(3, -1, -1):
+    key = f"ob:hist:bn:f:BTCUSDT:{cid - i}"
+    for val, score in r.zrangebyscore(key, since_ms, "+inf", withscores=True):
+        parts = val.decode().split("|")
+        # parts[0]=b1, parts[1]=bq1, ..., parts[39]=aq10, parts[40]=ts_ms
+        rows.append({
+            "b1": parts[0], "a1": parts[20],
+            "ts_ms": int(parts[40])
+        })
+
+print(f"Rows in last hour: {len(rows)}")
+if rows:
+    print(f"Best bid: {rows[-1]['b1']},  Best ask: {rows[-1]['a1']}")
+EOF
+```
+
+### Scan current OB keys
+
+```bash
+# All ob keys (current state)
+redis-cli -s /var/run/redis/redis.sock --scan --pattern "ob:bn:*" | grep -v hist | wc -l
+
+# Check a specific exchange+market
+redis-cli -s /var/run/redis/redis.sock --scan --pattern "ob:bb:f:*" | grep -v hist
+
+# Count all ob: history chunks
+redis-cli -s /var/run/redis/redis.sock --scan --pattern "ob:hist:*" | wc -l
+
+# Get best bid/ask from current OB for a symbol
+redis-cli -s /var/run/redis/redis.sock HMGET ob:bn:f:BTCUSDT b1 bq1 a1 aq1 t
+```
+
+### Check OB data freshness
+
+```bash
+redis-cli -s /var/run/redis/redis.sock --scan --pattern "ob:bn:f:*" | grep -v hist | head -5 | while read key; do
+  T=$(redis-cli -s /var/run/redis/redis.sock HGET "$key" t 2>/dev/null)
+  [ -n "$T" ] && echo "$key  $(( ($(date +%s%3N) - T) / 1000 ))s old"
+done
+```
+
+### Memory estimate
+
+~1 sample/sec × 3600 sec × 4 chunks × 4000 ob×symbol pairs × ~200 bytes ≈ **2–3 GB** peak (10-level OB entries are ~4× larger than single best-price entries).
+
+---
+
+## 10. Updating pair lists
 
 New coins get listed and delisted regularly. Refresh weekly or after major exchange announcements.
 
@@ -475,7 +620,7 @@ python3 run_all.py
 
 ---
 
-## 10. Stopping the system
+## 11. Stopping the system
 
 ### Foreground (Ctrl+C)
 
@@ -495,7 +640,7 @@ kill $(cat run_all.pid)
 
 ---
 
-## 11. Querying Redis directly
+## 12. Querying Redis directly
 
 ```bash
 redis-cli -s /var/run/redis/redis.sock
@@ -514,7 +659,10 @@ redis-cli -s /var/run/redis/redis.sock HGETALL md:bn:s:BTCUSDT
 ### Key naming
 
 ```
-md:{ex}:{mkt}:{symbol}
+md:{ex}:{mkt}:{symbol}       — best bid/ask HASH (3 fields: b, a, t)
+ob:{ex}:{mkt}:{symbol}       — 10-level order book HASH (41 fields: b1..b10, bq1..bq10, a1..a10, aq1..aq10, t)
+md:hist:{ex}:{mkt}:{sym}:{chunk_id}   — price history ZSET
+ob:hist:{ex}:{mkt}:{sym}:{chunk_id}   — order book history ZSET
 
 {ex}:  bn=Binance  bb=Bybit  ok=OKX  gt=Gate.io
 {mkt}: s=spot      f=futures
@@ -523,20 +671,36 @@ md:{ex}:{mkt}:{symbol}
 ### Useful commands
 
 ```bash
-# Total keys
+# Total keys (all types)
 redis-cli -s /var/run/redis/redis.sock DBSIZE
 
-# All Binance keys
-redis-cli -s /var/run/redis/redis.sock --scan --pattern "md:bn:*"
+# Best-price keys for Binance spot
+redis-cli -s /var/run/redis/redis.sock --scan --pattern "md:bn:s:*" | grep -v hist
+
+# Order book keys for Binance spot
+redis-cli -s /var/run/redis/redis.sock --scan --pattern "ob:bn:s:*" | grep -v hist
+
+# Get best bid/ask (md collector)
+redis-cli -s /var/run/redis/redis.sock HGETALL md:bn:s:BTCUSDT
+
+# Get full 10-level order book (ob collector)
+redis-cli -s /var/run/redis/redis.sock HGETALL ob:bn:s:BTCUSDT
+
+# Get just the top-of-book from OB key
+redis-cli -s /var/run/redis/redis.sock HMGET ob:bn:f:BTCUSDT b1 bq1 a1 aq1 t
 
 # Check data age for a key
 T=$(redis-cli -s /var/run/redis/redis.sock HGET md:bn:s:BTCUSDT t)
 echo "Age: $(( ($(date +%s%3N) - T) / 1000 ))s"
+
+# Check OB data age
+T=$(redis-cli -s /var/run/redis/redis.sock HGET ob:bn:f:BTCUSDT t)
+echo "OB Age: $(( ($(date +%s%3N) - T) / 1000 ))s"
 ```
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 ### Collector shows `CRASHED`
 
@@ -598,9 +762,40 @@ sudo bash setup_redis.sh --check
 sudo systemctl start redis   # if down
 ```
 
+### OB collector shows `subscribed` but 0 msgs after 60s
+
+This means subscriptions were sent but no data is coming back. Common causes:
+
+1. **Wrong channel name** — verify the exchange accepts the channel. All channels were verified in testing:
+   - Binance: `@depth10@100ms` combined streams ✓
+   - Bybit: `orderbook.50.{SYM}` (NOT `orderbook.10` — does not exist) ✓
+   - OKX: `books` channel ✓
+   - Gate spot: `spot.order_book` with interval `"100ms"` ✓
+   - Gate futures: `futures.order_book` with interval `"0"` (NOT `"100ms"`) ✓
+
+2. **Exchange rejected subscription** — check logs for error frames:
+```bash
+jq 'select(.script | startswith("ob_")) | select(.lvl == "WARN")' logs/collectors_*.log
+```
+
+### OB `avg_levels` is consistently below 10.0
+
+Means some symbols consistently have fewer than 10 levels in the book (thin markets). This is normal for low-liquidity pairs. Check which symbols trigger shallow warnings:
+
+```bash
+jq 'select(.script | startswith("ob_")) | select(.event == "stats") | {script, avg_levels, shallow_warnings}' logs/collectors_*.log | tail -20
+```
+
+### OB `books_initialized` count stopped growing (Bybit/OKX)
+
+Means some symbols never received their initial snapshot. Usually resolves on reconnect. If persistent:
+```bash
+jq 'select(.script | startswith("ob_bb") or startswith("ob_ok")) | select(.event == "delta_before_snapshot" or .event == "update_before_snapshot")' logs/collectors_*.log | tail -10
+```
+
 ---
 
-## 13. System health checks
+## 14. System health checks
 
 ### Quick check
 
@@ -620,10 +815,25 @@ sudo bash setup_redis.sh --check
 ### Check data freshness
 
 ```bash
-redis-cli -s /var/run/redis/redis.sock --scan --pattern "md:*" | head -10 | while read key; do
+# md keys (best bid/ask)
+redis-cli -s /var/run/redis/redis.sock --scan --pattern "md:bn:s:*" | grep -v hist | head -5 | while read key; do
   T=$(redis-cli -s /var/run/redis/redis.sock HGET "$key" t 2>/dev/null)
-  [ -n "$T" ] && echo "$key  $(( ($(date +%s%3N) - T) / 1000 ))s old"
+  [ -n "$T" ] && echo "md $key  $(( ($(date +%s%3N) - T) / 1000 ))s old"
 done
+
+# ob keys (10-level order book)
+redis-cli -s /var/run/redis/redis.sock --scan --pattern "ob:bn:f:*" | grep -v hist | head -5 | while read key; do
+  T=$(redis-cli -s /var/run/redis/redis.sock HGET "$key" t 2>/dev/null)
+  [ -n "$T" ] && echo "ob $key  $(( ($(date +%s%3N) - T) / 1000 ))s old"
+done
+```
+
+### Check OB collector stats
+
+```bash
+# Latest stats from each ob collector
+jq 'select(.script | startswith("ob_") and (.event == "stats"))' logs/collectors_*.log | \
+  jq -s 'group_by(.script) | map(last)[] | {script, msgs_per_sec, avg_levels, shallow_warnings}'
 ```
 
 ### Errors in the last hour
@@ -636,7 +846,7 @@ awk -v cutoff="$(date -d '1 hour ago' +%s)" '
 
 ---
 
-## 14. Reference
+## 15. Reference
 
 ### run_all.py flags
 
@@ -647,7 +857,7 @@ python3 run_all.py [OPTIONS]
 --no-dash    No live dashboard, JSON logs only
 ```
 
-### Collector constants
+### md Collector constants (best bid/ask — binance_spot, etc.)
 
 | Constant | Value | Description |
 |----------|-------|-------------|
@@ -656,6 +866,26 @@ python3 run_all.py [OPTIONS]
 | `STATS_INTERVAL` | 30s | Stats log frequency |
 | `RECONNECT_DELAY` | 3s | Wait after disconnect |
 | `PING_INTERVAL` | 20–25s | Exchange keepalive |
+
+### md Collector log events (full list)
+
+| Event | Level | Key fields |
+|-------|-------|------------|
+| `startup` | INFO | — |
+| `symbols_loaded` | INFO | `count`, `file` |
+| `redis_connected` | INFO | `socket` |
+| `connecting` | INFO | `chunk_symbols` or `total_symbols` |
+| `connected` | INFO | — |
+| `subscribed` | INFO | `total_symbols`, `subscribe_ms` |
+| `subscribing_progress` | INFO | `subscribed`, `total`, `elapsed_ms` |
+| `book_init` | INFO | `symbol`, `bid_levels`, `ask_levels`, `books_initialized` *(Bybit/OKX)* |
+| `first_message` | INFO | `ms_since_connected`, `first_sym` |
+| `delta_before_snapshot` | WARN | `symbol`, `delta_skipped_total` *(Bybit/OKX)* |
+| `update_before_snapshot` | WARN | `symbol`, `update_skipped_total` *(OKX)* |
+| `stats` | INFO | `msgs_total`, `msgs_per_sec`, `flushes_total`, `avg_pipeline_ms` |
+| `disconnected` | WARN | `reason` |
+| `reconnecting` | INFO | `delay_sec` |
+| `recv_error` | WARN | `reason` |
 
 ### Staleness monitor constants
 
@@ -691,14 +921,85 @@ python3 run_all.py [OPTIONS]
 | `stats` | INFO | `signals_total`, `anomalies_total`, `cooldowns_active`, `snapshots_active`, `last_cycle_ms` |
 | `cycle_error` | ERROR | `reason` |
 
-### History writer constants (hist_writer.py)
+### ob Collector constants (10-level order book — ob_binance_spot, etc.)
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `LEVELS` | 10 | Depth levels written per side |
+| `BATCH_SIZE` | 100 | Redis pipeline flush threshold |
+| `BATCH_TIMEOUT` | 20ms | Redis pipeline flush timeout |
+| `STATS_INTERVAL` | 30s | Stats log frequency |
+| `RECONNECT_DELAY` | 3s | Wait after disconnect |
+| `PING_INTERVAL` | 20s | Exchange keepalive |
+| `SUB_DELAY` | 10ms | Delay between subscribe messages *(Gate)* |
+| `SUB_LOG_EVERY` | 100 | Log progress every N subscriptions *(Gate)* |
+| `SUB_BATCH` | 10 (spot) / 200 (futures) | Symbols per subscribe batch *(Bybit)* |
+| `CHUNK_SIZE` | 200 | Symbols per WS connection *(Binance)* |
+
+### ob Collector WS channel details
+
+| Exchange | WS Endpoint | Channel | Update Model |
+|----------|-------------|---------|--------------|
+| Binance spot | `stream.binance.com` | `{sym}@depth10@100ms` combined stream | Periodic snapshots (no local book) |
+| Binance futures | `fstream.binance.com` | `{sym}@depth10@100ms` combined stream | Periodic snapshots; uses `b`/`a` fields (not `bids`/`asks`) |
+| Bybit spot | `stream.bybit.com/v5/public/spot` | `orderbook.50.{SYM}` | Snapshot + delta → local book (top 10 extracted) |
+| Bybit futures | `stream.bybit.com/v5/public/linear` | `orderbook.50.{SYM}` | Snapshot + delta → local book (top 10 extracted) |
+| OKX spot | `ws.okx.com:8443/ws/v5/public` | `books` channel | Snapshot + update → local book (up to 400 levels, top 10 extracted) |
+| OKX futures | `ws.okx.com:8443/ws/v5/public` | `books` channel | Snapshot + update → local book (up to 400 levels, top 10 extracted) |
+| Gate.io spot | `api.gateio.ws/ws/v4/` | `spot.order_book`, interval `100ms` | Periodic full snapshots |
+| Gate.io futures | `fx-ws.gateio.ws/v4/ws/usdt` | `futures.order_book`, interval `0` | Periodic full snapshots |
+
+### ob Collector log events (full list)
+
+| Event | Level | Key fields |
+|-------|-------|------------|
+| `startup` | INFO | — |
+| `symbols_loaded` | INFO | `count`, `file` |
+| `redis_connected` | INFO | `socket` |
+| `subscribing` | INFO | `total_symbols`, `connections` *(Binance)* |
+| `connecting` | INFO | `total_symbols` or `chunk_symbols` |
+| `connected` | INFO | — |
+| `subscribed` | INFO | `total_symbols`, `subscribe_ms` |
+| `subscribing_progress` | INFO | `subscribed`, `total`, `elapsed_ms` *(Gate)* |
+| `book_init` | INFO | `symbol`, `bid_levels`, `ask_levels`, `books_initialized` *(Bybit/OKX)* |
+| `first_message` | INFO | `ms_since_connected`, `first_sym` |
+| `delta_before_snapshot` | WARN | `symbol`, `delta_skipped_total` *(Bybit)* |
+| `update_before_snapshot` | WARN | `symbol`, `update_skipped_total` *(OKX)* |
+| `stats` | INFO | `msgs_total`, `msgs_per_sec`, `flushes_total`, `avg_pipeline_ms`, `avg_levels`, `shallow_warnings`, *(Bybit/OKX add)* `books_initialized`, `snapshots_total`, `deltas_total`, `delta_skipped` |
+| `disconnected` | WARN | `reason` |
+| `reconnecting` | INFO | `delay_sec` |
+| `recv_error` | WARN | `reason` |
+
+### ob Collector stats fields
+
+| Field | Description |
+|-------|-------------|
+| `msgs_total` | Total OB snapshots written to Redis |
+| `msgs_per_sec` | Rate over last 30s interval |
+| `flushes_total` | Redis pipeline batches executed |
+| `avg_pipeline_ms` | Average Redis pipeline flush latency |
+| `avg_levels` | Average levels present per flush (max 10.0) — lower = shallower book |
+| `shallow_warnings` | Times a symbol had < 10 levels on either bid or ask side |
+| `books_initialized` | Symbols with a live local book *(Bybit/OKX only)* |
+| `snapshots_total` | Snapshot messages received *(Bybit/OKX only)* |
+| `deltas_total` | Delta/update messages received *(Bybit/OKX only)* |
+| `delta_skipped` | Deltas dropped (arrived before snapshot) *(Bybit/OKX only)* |
+
+### History writer constants (hist_writer.py / ob_hist_writer.py)
+
+Both `hist_writer.py` (md) and `ob_hist_writer.py` (ob) use identical chunk parameters:
 
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `CHUNK_SEC` | 1200s | 20-minute chunk duration |
 | `MAX_CHUNKS` | 4 | Chunks kept at once (80 min window) |
 | `SAMPLE_SEC` | 1s | Max write rate per symbol |
-| `CONFIG_KEY` | `md:hist:config` | Global config key in Redis |
+| `CONFIG_KEY` | `md:hist:config` (md) / `ob:hist:config` (ob) | Global config key in Redis |
+| `LEVELS` | 10 | Depth levels per side stored per sample *(ob only)* |
+
+Member format in Redis ZSET:
+- **md** (`md:hist:*`): `{bid}|{ask}|{ts_ms}`
+- **ob** (`ob:hist:*`): `b1|bq1|b2|bq2|...|b10|bq10|a1|aq1|...|a10|aq10|ts_ms` (41 pipe-delimited values)
 
 ### Log rotation
 
