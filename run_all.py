@@ -20,6 +20,7 @@ run_all.py — запускает все 8 WS-коллекторов + staleness
 import argparse
 import asyncio
 import importlib
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -31,6 +32,9 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 from rich.text import Text
+
+OLD_DIR    = Path(__file__).parent / "old"
+SIG_DIR    = Path(__file__).parent / "signals"
 
 COLLECTORS = [
     # ── price / best-bid-ask collectors (md:* keys) ──────────────────────────
@@ -60,6 +64,29 @@ CHUNK_HOURS  = 12
 MAX_CHUNKS   = 2
 
 sys.path.insert(0, str(Path(__file__).parent / "collectors"))
+
+
+# ── archive old data ─────────────────────────────────────────────────────────
+
+def archive_old_data() -> str | None:
+    """
+    Move logs/ and signals/ into old/{YYYY-MM-DD_HH-MM}/ before each run.
+    Returns the archive folder name, or None if nothing was moved.
+    """
+    dirs_to_move = [(LOG_DIR, "logs"), (SIG_DIR, "signals")]
+    has_content  = any(d.exists() and any(d.iterdir()) for d, _ in dirs_to_move if d.exists())
+    if not has_content:
+        return None
+
+    ts      = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    dst_run = OLD_DIR / ts
+    dst_run.mkdir(parents=True, exist_ok=True)
+
+    for src, name in dirs_to_move:
+        if src.exists() and any(src.iterdir()):
+            shutil.move(str(src), str(dst_run / name))
+
+    return ts
 
 
 # ── rotating log writer ───────────────────────────────────────────────────────
@@ -353,6 +380,9 @@ async def run_collector(name: str) -> None:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 async def main(with_buckets: bool = False, no_dash: bool = False) -> None:
+    # ── 1. archive old logs/signals ───────────────────────────────────────────
+    archived = archive_old_data()
+
     state      = make_state()
     real_buf   = sys.stdout.buffer
     log_writer = RotatingLogWriter(LOG_DIR, CHUNK_HOURS, MAX_CHUNKS)
@@ -362,8 +392,11 @@ async def main(with_buckets: bool = False, no_dash: bool = False) -> None:
 
     log("INFO", "startup", collectors=COLLECTORS, staleness_buckets=with_buckets,
         log_dir=str(LOG_DIR), chunk_hours=CHUNK_HOURS, max_chunks=MAX_CHUNKS)
+    if archived:
+        log("INFO", "archived", folder=str(OLD_DIR / archived),
+            note="logs and signals moved before start")
 
-    # Flush Redis before starting collectors
+    # ── 2. flush Redis ────────────────────────────────────────────────────────
     await flush_redis()
 
     tasks = [asyncio.create_task(run_collector(name)) for name in COLLECTORS]
