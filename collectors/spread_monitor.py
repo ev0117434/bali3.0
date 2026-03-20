@@ -23,7 +23,7 @@ from pathlib import Path
 import orjson
 import redis.asyncio as aioredis
 
-from hist_writer import write_snapshot_history
+from hist_writer import write_snapshot_history, SNAPSHOT_CSV_HEADER, OB_EMPTY, OB_LEVELS
 
 SCRIPT = "spread_monitor"
 
@@ -55,6 +55,24 @@ EXCHANGE_CODE = {
 CODE_NAME = {v: k for k, v in EXCHANGE_CODE.items()}
 
 CSV_HEADER = "spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts\n"
+
+
+def _format_ob(ob_dict: dict) -> str:
+    """
+    Convert ob HASH (bytes keys/values from HGETALL) to 40 comma-separated CSV values:
+    b1,bq1,...,b10,bq10,a1,aq1,...,a10,aq10
+    Returns OB_EMPTY if the dict is empty (ob collector not running or pair missing).
+    """
+    if not ob_dict:
+        return OB_EMPTY
+    parts = []
+    for i in range(1, OB_LEVELS + 1):
+        parts.append(ob_dict.get(f"b{i}".encode(),  b"").decode())
+        parts.append(ob_dict.get(f"bq{i}".encode(), b"").decode())
+    for i in range(1, OB_LEVELS + 1):
+        parts.append(ob_dict.get(f"a{i}".encode(),  b"").decode())
+        parts.append(ob_dict.get(f"aq{i}".encode(), b"").decode())
+    return ",".join(parts)
 
 
 # ── logger ────────────────────────────────────────────────────────────────────
@@ -132,6 +150,21 @@ async def scan_cycle(
         for key, vals in zip(key_list, results)
     }
 
+    # Batch-fetch OB data for all pairs with active snapshots (one pipeline)
+    ob_cache: dict[bytes, dict] = {}
+    if active_snapshots:
+        snap_pairs = list(active_snapshots.keys())
+        ob_keys: list[bytes] = []
+        for direction, sym in snap_pairs:
+            spot_ex_s, fut_ex_s, _ = directions[direction]
+            ob_keys.append(f"ob:{spot_ex_s}:s:{sym}".encode())
+            ob_keys.append(f"ob:{fut_ex_s}:f:{sym}".encode())
+        async with r.pipeline(transaction=False) as pipe:
+            for k in ob_keys:
+                pipe.hgetall(k)
+            ob_results = await pipe.execute()
+        ob_cache = dict(zip(ob_keys, ob_results))
+
     for direction, (spot_ex, fut_ex, symbols) in directions.items():
         for sym in symbols:
             counters["scanned"] += 1
@@ -178,9 +211,12 @@ async def scan_cycle(
             snap     = active_snapshots.get(snap_key)
             if snap:
                 if now <= snap["expires"]:
+                    s_ob = _format_ob(ob_cache.get(f"ob:{spot_ex}:s:{sym}".encode(), {}))
+                    f_ob = _format_ob(ob_cache.get(f"ob:{fut_ex}:f:{sym}".encode(), {}))
                     snap_row = (
                         f"{spot_name},{fut_name},{sym},"
-                        f"{spot_ask_s},{fut_bid_s},{spread_r},{now_ms}\n"
+                        f"{spot_ask_s},{fut_bid_s},{spread_r},{now_ms},"
+                        f"{s_ob},{f_ob}\n"
                     ).encode()
                     try:
                         snap["fh"].write(snap_row)
@@ -216,9 +252,9 @@ async def scan_cycle(
                 _snap_dir.mkdir(parents=True, exist_ok=True)
                 _fname    = _snap_dir / f"{spot_name}_{fut_name}_{sym}_{_ts_str}.csv"
                 _fh       = open(_fname, "wb")
-                _fh.write(CSV_HEADER.encode())
+                _fh.write(SNAPSHOT_CSV_HEADER.encode())
                 _fh.flush()
-                # prepend 1-hour history
+                # prepend 1-hour history (includes OB history)
                 hist_rows = await write_snapshot_history(
                     r, _fh, spot_ex, fut_ex, sym, spot_name, fut_name)
                 if hist_rows:
@@ -227,11 +263,18 @@ async def scan_cycle(
                 active_snapshots[snap_key] = {"fh": _fh, "expires": now + COOLDOWN_SEC}
                 log("INFO", "snapshot_opened", direction=direction, symbol=sym,
                     file=str(_fname), duration_sec=COOLDOWN_SEC)
-                # first row
+                # first live row — fetch OB for this new pair
                 try:
+                    async with r.pipeline(transaction=False) as _pipe:
+                        _pipe.hgetall(f"ob:{spot_ex}:s:{sym}".encode())
+                        _pipe.hgetall(f"ob:{fut_ex}:f:{sym}".encode())
+                        _s_ob_raw, _f_ob_raw = await _pipe.execute()
+                    _s_ob = _format_ob(_s_ob_raw)
+                    _f_ob = _format_ob(_f_ob_raw)
                     _fh.write((
                         f"{spot_name},{fut_name},{sym},"
-                        f"{spot_ask_s},{fut_bid_s},{spread_r},{now_ms}\n"
+                        f"{spot_ask_s},{fut_bid_s},{spread_r},{now_ms},"
+                        f"{_s_ob},{_f_ob}\n"
                     ).encode())
                     _fh.flush()
                 except Exception:

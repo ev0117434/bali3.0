@@ -25,6 +25,27 @@ MAX_CHUNKS  = 4         # keep 4 chunks (delete oldest when starting 5th)
 SAMPLE_SEC  = 1         # max 1 write per second per symbol
 CONFIG_KEY  = b"md:hist:config"
 
+OB_LEVELS = 10
+OB_EMPTY  = "," * (OB_LEVELS * 4 - 1)   # 39 commas → 40 empty CSV fields
+
+# Column names for snapshot CSV (exported, used by spread_monitor)
+_s_ob_cols = ",".join(
+    [f"s_b{i}"  for i in range(1, OB_LEVELS + 1)] +
+    [f"s_bq{i}" for i in range(1, OB_LEVELS + 1)] +
+    [f"s_a{i}"  for i in range(1, OB_LEVELS + 1)] +
+    [f"s_aq{i}" for i in range(1, OB_LEVELS + 1)]
+)
+_f_ob_cols = ",".join(
+    [f"f_b{i}"  for i in range(1, OB_LEVELS + 1)] +
+    [f"f_bq{i}" for i in range(1, OB_LEVELS + 1)] +
+    [f"f_a{i}"  for i in range(1, OB_LEVELS + 1)] +
+    [f"f_aq{i}" for i in range(1, OB_LEVELS + 1)]
+)
+SNAPSHOT_CSV_HEADER = (
+    f"spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts,"
+    f"{_s_ob_cols},{_f_ob_cols}\n"
+)
+
 
 def chunk_id(ts_sec: float) -> int:
     return int(ts_sec // CHUNK_SEC)
@@ -116,7 +137,46 @@ class HistWriter:
         self._dirty = False
 
 
-# ── history reader (used by spread_monitor) ───────────────────────────────────
+# ── history readers (used by spread_monitor) ─────────────────────────────────
+
+def _ob_hist_key(ex: str, mkt: str, sym: str, cid: int) -> bytes:
+    return f"ob:hist:{ex}:{mkt}:{sym}:{cid}".encode()
+
+
+async def read_ob_history(
+    r:         aioredis.Redis,
+    ex:        str,
+    mkt:       str,
+    sym:       str,
+    since_sec: float = 3600.0,
+) -> dict:
+    """
+    Return dict  ts_sec -> comma-separated string of 40 OB values
+    (b1,bq1,...,b10,bq10,a1,aq1,...,a10,aq10).
+    Reads all MAX_CHUNKS ob:hist chunks in one pipeline round-trip.
+    """
+    now_ms   = int(time.time() * 1000)
+    since_ms = now_ms - int(since_sec * 1000)
+    cid      = chunk_id(time.time())
+
+    async with r.pipeline(transaction=False) as pipe:
+        for i in range(MAX_CHUNKS):
+            pipe.zrangebyscore(_ob_hist_key(ex, mkt, sym, cid - i), since_ms, "+inf")
+        results = await pipe.execute()
+
+    ob_by_sec: dict = {}
+    for chunk_rows in results:
+        for entry in chunk_rows:
+            parts = entry.split(b"|")
+            if len(parts) != 41:          # 40 ob fields + ts_ms
+                continue
+            try:
+                ts_sec = int(parts[40]) // 1000
+            except (ValueError, IndexError):
+                continue
+            ob_by_sec[ts_sec] = ",".join(p.decode() for p in parts[:40])
+    return ob_by_sec
+
 
 async def read_history(
     r:        aioredis.Redis,
@@ -164,7 +224,7 @@ async def write_snapshot_history(
 ) -> int:
     """
     Read 1-hour history for spot+futures, match by second bucket,
-    compute spread_pct, write CSV rows to fh.
+    compute spread_pct, write CSV rows (with OB data) to fh.
     Returns number of rows written.
     """
     spot_hist = await read_history(r, spot_ex, "s", sym, since_sec)
@@ -172,6 +232,10 @@ async def write_snapshot_history(
 
     if not spot_hist or not fut_hist:
         return 0
+
+    # OB history — best-effort; missing seconds get empty OB fields
+    spot_ob = await read_ob_history(r, spot_ex, "s", sym, since_sec)
+    fut_ob  = await read_ob_history(r, fut_ex,  "f", sym, since_sec)
 
     # Build second-bucket dicts: ts_sec -> ask (spot) / bid (futures)
     spot_ask_by_sec: dict = {}
@@ -192,10 +256,13 @@ async def write_snapshot_history(
         if spot_ask <= 0 or fut_bid <= 0:
             continue
         spread_r = round((fut_bid - spot_ask) / spot_ask * 100, 4)
-        ts_ms    = ts_sec * 1000
+        ts_ms_val = ts_sec * 1000
+        s_ob = spot_ob.get(ts_sec, OB_EMPTY)
+        f_ob = fut_ob.get(ts_sec, OB_EMPTY)
         row = (
             f"{spot_name},{fut_name},{sym},"
-            f"{spot_ask_by_sec[ts_sec]},{fut_bid_by_sec[ts_sec]},{spread_r},{ts_ms}\n"
+            f"{spot_ask_by_sec[ts_sec]},{fut_bid_by_sec[ts_sec]},{spread_r},{ts_ms_val},"
+            f"{s_ob},{f_ob}\n"
         ).encode()
         fh.write(row)
         written += 1
