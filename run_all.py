@@ -224,6 +224,8 @@ class LogInterceptor:
         elif event == "check_failed":
             s["status"] = "check_err"
             s["errors"] += 1
+        elif event == "spread_monitor_waiting":
+            s["status"] = f"wait:{int(rec.get('delay_sec', 0))}s"
         elif event == "directions_loaded":
             s["status"] = "scanning"
         elif event == "signal":
@@ -259,6 +261,8 @@ def _status_text(s: dict) -> Text:
     style  = STATUS_STYLE.get(status, "white")
     if status.startswith("STALE:"):
         style = "red bold"
+    elif status.startswith("wait:"):
+        style = "yellow"
     return Text(status, style=style)
 
 
@@ -377,9 +381,23 @@ async def run_collector(name: str) -> None:
         log("ERROR", "collector_crashed", collector=name, reason=str(e))
 
 
+async def run_spread_delayed(delay: float) -> None:
+    """Start spread_monitor after an optional delay (signals/snapshots)."""
+    if delay > 0:
+        log("INFO", "spread_monitor_waiting", delay_sec=delay,
+            note="signals and snapshots will start after delay")
+        await asyncio.sleep(delay)
+    spread = importlib.import_module("spread_monitor")
+    log("INFO", "collector_started", collector="spread_monitor")
+    try:
+        await spread.main()
+    except Exception as e:
+        log("ERROR", "collector_crashed", collector="spread_monitor", reason=str(e))
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
-async def main(with_buckets: bool = False, no_dash: bool = False) -> None:
+async def main(with_buckets: bool = False, no_dash: bool = False, spread_delay: float = 0.0) -> None:
     # ── 1. archive old logs/signals ───────────────────────────────────────────
     archived = archive_old_data()
 
@@ -391,7 +409,8 @@ async def main(with_buckets: bool = False, no_dash: bool = False) -> None:
     sys.stdout   = interceptor  # type: ignore
 
     log("INFO", "startup", collectors=COLLECTORS, staleness_buckets=with_buckets,
-        log_dir=str(LOG_DIR), chunk_hours=CHUNK_HOURS, max_chunks=MAX_CHUNKS)
+        log_dir=str(LOG_DIR), chunk_hours=CHUNK_HOURS, max_chunks=MAX_CHUNKS,
+        spread_delay_sec=spread_delay)
     if archived:
         log("INFO", "archived", folder=str(OLD_DIR / archived),
             note="logs and signals moved before start")
@@ -405,9 +424,7 @@ async def main(with_buckets: bool = False, no_dash: bool = False) -> None:
     tasks.append(asyncio.create_task(staleness.main(with_buckets)))
     log("INFO", "collector_started", collector="staleness_monitor")
 
-    spread = importlib.import_module("spread_monitor")
-    tasks.append(asyncio.create_task(spread.main()))
-    log("INFO", "collector_started", collector="spread_monitor")
+    tasks.append(asyncio.create_task(run_spread_delayed(spread_delay)))
 
     start   = time.time()
     console = Console(stderr=True, force_terminal=sys.stderr.isatty())
@@ -450,7 +467,16 @@ if __name__ == "__main__":
                         help="Disable live dashboard, output JSON logs only")
     args = parser.parse_args()
 
+    # Ask how long to wait before starting signals/snapshots (spread_monitor)
+    spread_delay = 0.0
+    if sys.stdin.isatty():
+        try:
+            raw = input("Delay before signals/snapshots [seconds, Enter = 0]: ").strip()
+            spread_delay = max(0.0, float(raw)) if raw else 0.0
+        except (ValueError, EOFError):
+            spread_delay = 0.0
+
     try:
-        asyncio.run(main(args.buckets, args.no_dash))
+        asyncio.run(main(args.buckets, args.no_dash, spread_delay))
     except KeyboardInterrupt:
         pass
