@@ -17,6 +17,7 @@ spread_monitor.py — мониторинг спреда spot→futures по 12 �
 import asyncio
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import orjson
@@ -30,6 +31,7 @@ SIGNAL_JSONL    = SIGNALS_DIR / "signals.jsonl"
 SIGNAL_CSV      = SIGNALS_DIR / "signals.csv"
 ANOMALY_JSONL   = SIGNALS_DIR / "anomalies.jsonl"
 ANOMALY_CSV     = SIGNALS_DIR / "anomalies.csv"
+SNAPSHOT_DIR    = SIGNALS_DIR / "snapshots"
 
 REDIS_SOCK      = "/var/run/redis/redis.sock"
 
@@ -90,14 +92,15 @@ def load_directions() -> dict:
 # ── Redis scan cycle ──────────────────────────────────────────────────────────
 
 async def scan_cycle(
-    r:           aioredis.Redis,
-    directions:  dict,
-    cooldowns:   dict,
+    r:                aioredis.Redis,
+    directions:       dict,
+    cooldowns:        dict,
+    active_snapshots: dict,
     f_jsonl,
     f_csv,
     f_anomaly_jsonl,
     f_anomaly_csv,
-    counters:    dict,
+    counters:         dict,
 ) -> None:
     now_ms = int(time.time() * 1000)
     now    = time.time()
@@ -162,6 +165,32 @@ async def scan_cycle(
                 continue
 
             spread_pct = (fut_bid - spot_ask) / spot_ask * 100
+            spread_r   = round(spread_pct, 4)
+            spot_ask_s = spot_ask_b.decode()
+            fut_bid_s  = fut_bid_b.decode()
+            spot_name  = CODE_NAME.get(spot_ex, spot_ex)
+            fut_name   = CODE_NAME.get(fut_ex,  fut_ex)
+
+            # ── write to active snapshot (every cycle, regardless of threshold) ──
+            snap_key = (direction, sym)
+            snap     = active_snapshots.get(snap_key)
+            if snap:
+                if now <= snap["expires"]:
+                    snap_row = (
+                        f"{spot_name},{fut_name},{sym},"
+                        f"{spot_ask_s},{fut_bid_s},{spread_r},{now_ms}\n"
+                    ).encode()
+                    try:
+                        snap["fh"].write(snap_row)
+                        snap["fh"].flush()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        snap["fh"].close()
+                    except Exception:
+                        pass
+                    del active_snapshots[snap_key]
 
             if spread_pct < MIN_SPREAD_PCT:
                 continue
@@ -177,11 +206,28 @@ async def scan_cycle(
             cooldowns[cd_key] = now + COOLDOWN_SEC
             counters["signals"] += 1
 
-            spot_ask_s = spot_ask_b.decode()
-            fut_bid_s  = fut_bid_b.decode()
-            spread_r   = round(spread_pct, 4)
-            spot_name  = CODE_NAME.get(spot_ex, spot_ex)
-            fut_name   = CODE_NAME.get(fut_ex,  fut_ex)
+            # ── open snapshot file ────────────────────────────────────────────
+            if snap_key not in active_snapshots:
+                _now_utc  = datetime.now(timezone.utc)
+                _ts_str   = _now_utc.strftime('%Y%m%d_%H%M%S')
+                _snap_dir = SNAPSHOT_DIR / _now_utc.strftime('%Y-%m-%d') / _now_utc.strftime('%H')
+                _snap_dir.mkdir(parents=True, exist_ok=True)
+                _fname    = _snap_dir / f"{spot_name}_{fut_name}_{sym}_{_ts_str}.csv"
+                _fh       = open(_fname, "wb")
+                _fh.write(CSV_HEADER.encode())
+                _fh.flush()
+                active_snapshots[snap_key] = {"fh": _fh, "expires": now + COOLDOWN_SEC}
+                log("INFO", "snapshot_opened", direction=direction, symbol=sym,
+                    file=str(_fname), duration_sec=COOLDOWN_SEC)
+                # first row
+                try:
+                    _fh.write((
+                        f"{spot_name},{fut_name},{sym},"
+                        f"{spot_ask_s},{fut_bid_s},{spread_r},{now_ms}\n"
+                    ).encode())
+                    _fh.flush()
+                except Exception:
+                    pass
 
             is_anomaly = spread_pct >= ANOMALY_THRESHOLD
 
@@ -239,16 +285,26 @@ async def scan_cycle(
 
 # ── stats loop ────────────────────────────────────────────────────────────────
 
-async def stats_loop(counters: dict, cooldowns: dict) -> None:
+async def stats_loop(counters: dict, cooldowns: dict, active_snapshots: dict) -> None:
     prev_signals = 0
     while True:
         await asyncio.sleep(STATS_INTERVAL)
 
+        now = time.time()
+
         # Cleanup expired cooldowns
-        now     = time.time()
         expired = [k for k, v in cooldowns.items() if v < now]
         for k in expired:
             del cooldowns[k]
+
+        # Cleanup snapshots that expired while their pair had stale data
+        expired_snaps = [k for k, v in active_snapshots.items() if v["expires"] < now]
+        for k in expired_snaps:
+            try:
+                active_snapshots[k]["fh"].close()
+            except Exception:
+                pass
+            del active_snapshots[k]
 
         signals = counters["signals"]
         log("INFO", "stats",
@@ -256,6 +312,7 @@ async def stats_loop(counters: dict, cooldowns: dict) -> None:
             signals_per_interval  = signals - prev_signals,
             anomalies_total       = counters["anomalies"],
             cooldowns_active      = len(cooldowns),
+            snapshots_active      = len(active_snapshots),
             scanned_total         = counters["scanned"],
             stale_skipped         = counters["stale_skipped"],
             cooldown_skipped      = counters["cooldown_skipped"],
@@ -320,7 +377,8 @@ async def main() -> None:
         anomaly_threshold_pct=ANOMALY_THRESHOLD,
     )
 
-    cooldowns: dict = {}
+    cooldowns:        dict = {}
+    active_snapshots: dict = {}
     counters = {
         "signals":          0,
         "anomalies":        0,
@@ -336,8 +394,8 @@ async def main() -> None:
         while True:
             t0 = time.monotonic()
             try:
-                await scan_cycle(r, directions, cooldowns, f_jsonl, f_csv,
-                                 f_anomaly_jsonl, f_anomaly_csv, counters)
+                await scan_cycle(r, directions, cooldowns, active_snapshots,
+                                 f_jsonl, f_csv, f_anomaly_jsonl, f_anomaly_csv, counters)
             except Exception as e:
                 log("ERROR", "cycle_error", reason=str(e)[:200])
             elapsed = time.monotonic() - t0
@@ -347,7 +405,7 @@ async def main() -> None:
 
     await asyncio.gather(
         poll_loop(),
-        stats_loop(counters, cooldowns),
+        stats_loop(counters, cooldowns, active_snapshots),
     )
 
 
