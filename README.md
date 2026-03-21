@@ -136,6 +136,11 @@ bali3.0/
 │   └── snapshots/YYYY-MM-DD/HH/        # Per-signal spread evolution (3500s window)
 │       └── {spot}_{fut}_{sym}_{ts}.csv
 │
+├── old/
+│   └── YYYY-MM-DD_HH-MM/              # Archived from previous run
+│       ├── logs/
+│       └── signals/
+│
 ├── dictionaries/
 │   ├── main.py                          # Dictionary generator (5 phases)
 │   ├── binance/
@@ -192,16 +197,21 @@ bali3.0/
 ## run_all.py
 
 Single entry point for all components. On startup:
-1. Flushes Redis (SCAN + DEL all keys)
-2. Opens rotating log file in `logs/`
-3. Starts all 16 collectors + staleness_monitor + spread_monitor as async tasks
-4. Renders live dashboard in terminal (stderr)
+1. Archives `logs/` and `signals/` to `old/YYYY-MM-DD_HH-MM/` (skipped if empty)
+2. Flushes Redis (SCAN + DEL all keys)
+3. Prompts: `Delay before signals/snapshots [seconds, Enter = 0]:` (stdin tty only; non-interactive defaults to 0)
+4. Starts all 16 collectors + staleness_monitor immediately
+5. Starts spread_monitor after the specified delay (0 = immediately)
 
 ```bash
 python3 run_all.py                  # dashboard + auto log file
 python3 run_all.py --buckets        # + staleness age-bucket distribution in logs
 python3 run_all.py --no-dash        # JSON logs only, no TUI
 ```
+
+In non-interactive mode (e.g. redirected stdin), the delay prompt is auto-skipped and defaults to 0.
+
+Previous runs' logs and signals accumulate under `old/` as `old/YYYY-MM-DD_HH-MM/logs/` and `old/YYYY-MM-DD_HH-MM/signals/`.
 
 ### Log rotation
 
@@ -504,6 +514,13 @@ Both files append across restarts. CSV header is written only on first creation.
 
 On every signal, a snapshot CSV opens at `signals/snapshots/YYYY-MM-DD/HH/{spot}_{fut}_{sym}_{ts}.csv`. It starts with up to 3600 historical rows (last 1 hour from `md:hist:*`), then appends live rows at 0.3s for the full 3500s cooldown window.
 
+**CSV columns (87 total):**
+- 7 base columns: `ts`, `spread_pct`, `spot_ask`, `fut_bid`, `symbol`, `spot_ex`, `fut_ex`
+- 40 spot order book columns: `s_b1`..`s_b10`, `s_bq1`..`s_bq10`, `s_a1`..`s_a10`, `s_aq1`..`s_aq10`
+- 40 futures order book columns: `f_b1`..`f_b10`, `f_bq1`..`f_bq10`, `f_a1`..`f_a10`, `f_aq1`..`f_aq10`
+
+Historical rows (prepended from `md:hist:*`) include corresponding `ob:hist:*` data joined by `ts_sec`. Seconds with no OB history entry get empty fields for the 80 OB columns. Live rows include `ob:*` HASH data fetched in a batch pipeline at each 0.3s cycle.
+
 ### Cooldown
 
 After a signal fires for `(direction, symbol)`, no new signal is written for that pair for **3500 seconds**. Cooldowns are in-memory and reset on restart.
@@ -547,13 +564,15 @@ Bali 3.0  uptime 120s  log collectors_2026-03-20_14-00.log
 ├──────────────────────────┼───────────┼────────┼───────────┼─────────┼─────────┼────────┼──────────┤
 │ staleness_monitor        │ ok        │   —    │ 2,933     │ stale:0 │    —    │   0    │    12s   │
 ├──────────────────────────┼───────────┼────────┼───────────┼─────────┼─────────┼────────┼──────────┤
-│ spread_monitor           │ scanning  │   3    │ 47        │  cd:0   │  18.4   │   0    │     1s   │
+│ spread_monitor           │ wait:300s │   —    │  —        │   —     │   —     │   0    │     1s   │
 └──────────────────────────┴───────────┴────────┴───────────┴─────────┴─────────┴─────────┴─────────┘
 ```
 
-**Status colors:** `streaming/scanning/ok` = green · `connecting/reconnecting` = yellow · `disconnected/STALE:N` = red · `CRASHED` = bold red
+**Status colors:** `streaming/scanning/ok` = green · `connecting/reconnecting/wait:Ns` = yellow · `disconnected/STALE:N` = red · `CRASHED` = bold red
 
-**spread_monitor columns:** `msgs/s` = signals/30s · `total` = total signals · `flushes` = `cd:N` active cooldowns · `pipe ms` = last cycle ms
+`wait:Ns` means spread_monitor is waiting for the startup delay to expire (N seconds remaining).
+
+**spread_monitor columns:** `msgs/s` = signals/30s · `total` = total signals · `flushes` = `cd:N` active cooldowns · `pipe ms` = last cycle ms · shows `wait:Ns` status before the delay expires
 
 ---
 

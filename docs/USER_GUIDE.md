@@ -118,12 +118,19 @@ python3 run_all.py
 ```
 
 What happens on startup:
-1. Redis is flushed (all old keys removed)
-2. A new log file is opened: `logs/collectors_YYYY-MM-DD_HH-MM.log`
-3. All 8 best-price collectors (`binance_spot`, `binance_futures`, `bybit_spot`, `bybit_futures`, `okx_spot`, `okx_futures`, `gate_spot`, `gate_futures`) start connecting
-4. All 8 order book collectors (`ob_binance_spot`, `ob_binance_futures`, `ob_bybit_spot`, `ob_bybit_futures`, `ob_okx_spot`, `ob_okx_futures`, `ob_gate_spot`, `ob_gate_futures`) start connecting
-5. `staleness_monitor` and `spread_monitor` start
-6. Live dashboard appears in terminal
+1. Previous `logs/` and `signals/` are moved to `old/YYYY-MM-DD_HH-MM/` (if non-empty)
+2. Redis is flushed (all old keys removed)
+3. You are prompted: `"Delay before signals/snapshots [seconds, Enter = 0]:"`
+   - Enter a number (e.g. `300`) to wait N seconds before `spread_monitor` starts
+   - Press Enter or type `0` to start everything immediately
+   - In non-interactive mode (piped/background), prompt is skipped, delay = 0
+4. All 8 best-price collectors (`binance_spot`, `binance_futures`, `bybit_spot`, `bybit_futures`, `okx_spot`, `okx_futures`, `gate_spot`, `gate_futures`) start connecting
+5. All 8 order book collectors (`ob_binance_spot`, `ob_binance_futures`, `ob_bybit_spot`, `ob_bybit_futures`, `ob_okx_spot`, `ob_okx_futures`, `ob_gate_spot`, `ob_gate_futures`) start connecting
+6. `staleness_monitor` starts
+7. `spread_monitor` starts after the specified delay
+8. Live dashboard appears in terminal
+
+Previous runs accumulate in `old/` with timestamped folders. Each contains `logs/` and `signals/` subdirectories.
 
 ### Start with staleness age distribution
 
@@ -376,13 +383,14 @@ signals/snapshots/2026-03-20/14/binance_bybit_BTCUSDT_20260320_143022.csv
 ### Snapshot CSV format
 
 ```
-spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
-binance,bybit,BTCUSDT,67234.10,68189.20,1.4200,1711234567123   ← history rows
-binance,bybit,BTCUSDT,67235.00,68190.50,1.4199,1711234568123   ← ...up to 3600 rows
-binance,bybit,BTCUSDT,67236.20,68191.00,1.4187,1711238067123   ← live rows (0.3s interval)
+spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts,
+s_b1,s_bq1,...,s_b10,s_bq10,s_a1,s_aq1,...,s_a10,s_aq10,   ← 40 spot OB columns
+f_b1,f_bq1,...,f_b10,f_bq10,f_a1,f_aq1,...,f_a10,f_aq10    ← 40 futures OB columns
 ```
 
-The file starts with **up to 3600 historical rows** (the last 1 hour of bid/ask data, sampled at 1/sec), then continues with live rows every 0.3 seconds. This means the snapshot is immediately useful even for the first signal after startup, as soon as an hour of history has been collected.
+Total: **87 columns**. The spot and futures OB columns contain the full 10-level order book at each moment in time.
+
+The file starts with **up to 3600 historical rows** (the last 1 hour from `md:hist:*` joined with `ob:hist:*` for order book depth at each second). Live rows every 0.3s include real-time OB data fetched in the same cycle. If `ob:hist:*` data is missing for a historical second, those 40 fields are empty.
 
 - `ts` is Unix time in **milliseconds**
 - `spread_pct` = `(futures_bid - spot_ask) / spot_ask × 100`, rounded to 4 decimal places
@@ -857,6 +865,8 @@ python3 run_all.py [OPTIONS]
 --no-dash    No live dashboard, JSON logs only
 ```
 
+At startup (interactive mode), prompts for delay before signals/snapshots. Skipped with delay=0 in non-interactive mode (stdin not tty).
+
 ### md Collector constants (best bid/ask — binance_spot, etc.)
 
 | Constant | Value | Description |
@@ -922,6 +932,8 @@ python3 run_all.py [OPTIONS]
 | `cycle_error` | ERROR | `reason` |
 
 ### ob Collector constants (10-level order book — ob_binance_spot, etc.)
+
+Each OB snapshot contributes 40 columns (20 bid + 20 ask) to snapshot CSVs, for a total of **87 columns** per snapshot row (7 base fields + 40 spot OB + 40 futures OB).
 
 | Constant | Value | Description |
 |----------|-------|-------------|
