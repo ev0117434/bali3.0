@@ -1,2 +1,0 @@
-{"ts":1774130209.9681845,"direction":"binance_spot_gate_futures","symbol":"FUNUSDT","spread_pct":2202.393,"spot_ask":"0.00137900","fut_bid":"0.03175","spot_ex":"bn","fut_ex":"gt"}
-{"ts":1774130227.8674142,"direction":"gate_spot_binance_futures","symbol":"EDGEUSDT","spread_pct":438.8159,"spot_ask":"0.13242","fut_bid":"0.7135000","spot_ex":"gt","fut_ex":"bn"}

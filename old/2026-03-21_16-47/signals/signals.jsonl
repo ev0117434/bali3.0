@@ -1,5 +1,0 @@
-{"ts":1774107067.385667,"direction":"binance_spot_bybit_futures","symbol":"NTRNUSDT","spread_pct":1.2459,"spot_ask":"0.00610000","fut_bid":"0.006176","spot_ex":"bn","fut_ex":"bb"}
-{"ts":1774107067.385667,"direction":"binance_spot_gate_futures","symbol":"NTRNUSDT","spread_pct":1.6393,"spot_ask":"0.00610000","fut_bid":"0.0062","spot_ex":"bn","fut_ex":"gt"}
-{"ts":1774107067.385667,"direction":"gate_spot_bybit_futures","symbol":"VANRYUSDT","spread_pct":7.782,"spot_ask":"0.005577","fut_bid":"0.006011","spot_ex":"gt","fut_ex":"bb"}
-{"ts":1774107124.133664,"direction":"binance_spot_bybit_futures","symbol":"RDNTUSDT","spread_pct":1.1275,"spot_ask":"0.00612000","fut_bid":"0.006189","spot_ex":"bn","fut_ex":"bb"}
-{"ts":1774107428.5634155,"direction":"gate_spot_bybit_futures","symbol":"RDNTUSDT","spread_pct":1.3467,"spot_ask":"0.006683","fut_bid":"0.006773","spot_ex":"gt","fut_ex":"bb"}

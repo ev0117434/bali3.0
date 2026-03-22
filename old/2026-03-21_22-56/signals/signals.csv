@@ -1,4 +1,0 @@
-spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
-gate,bybit,VANRYUSDT,0.005476,0.005902,7.7794,1774130157236
-gate,binance,VANRYUSDT,0.005476,0.0058940,7.6333,1774130157538
-gate,binance,AIAUSDT,0.094,0.0950400,1.1064,1774130159644
