@@ -130,6 +130,7 @@ dictionaries/
 """
 
 import asyncio
+import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -140,10 +141,12 @@ sys.path.insert(0, str(BASE_DIR))
 
 COMBINATION_DIR = BASE_DIR / "combination"
 SUBSCRIBE_DIR   = BASE_DIR / "subscribe"
+COLLECTORS_DIR  = BASE_DIR.parent / "collectors"
 
 # ── Таблица пересечений ────────────────────────────────────────────────────────
 # Каждый кортеж: (ключ_A, ключ_B, имя_файла)
 COMBINATIONS = [
+    # Binance spot
     ("binance_spot", "bybit_futures",   "binance_spot_bybit_futures.txt"),
     ("bybit_spot",   "binance_futures", "bybit_spot_binance_futures.txt"),
     ("binance_spot", "okx_futures",     "binance_spot_okx_futures.txt"),
@@ -156,6 +159,15 @@ COMBINATIONS = [
     ("gate_spot",    "bybit_futures",   "gate_spot_bybit_futures.txt"),
     ("okx_spot",     "gate_futures",    "okx_spot_gate_futures.txt"),
     ("gate_spot",    "okx_futures",     "gate_spot_okx_futures.txt"),
+    # Bitget (новые комбинации)
+    ("binance_spot", "bitget_futures",  "binance_spot_bitget_futures.txt"),
+    ("bitget_spot",  "binance_futures", "bitget_spot_binance_futures.txt"),
+    ("bybit_spot",   "bitget_futures",  "bybit_spot_bitget_futures.txt"),
+    ("bitget_spot",  "bybit_futures",   "bitget_spot_bybit_futures.txt"),
+    ("okx_spot",     "bitget_futures",  "okx_spot_bitget_futures.txt"),
+    ("bitget_spot",  "okx_futures",     "bitget_spot_okx_futures.txt"),
+    ("gate_spot",    "bitget_futures",  "gate_spot_bitget_futures.txt"),
+    ("bitget_spot",  "gate_futures",    "bitget_spot_gate_futures.txt"),
 ]
 
 # ── Маппинг ключевых слов → файлы подписки ────────────────────────────────────
@@ -168,6 +180,8 @@ SUBSCRIBE_MAP = {
     "okx_futures":     SUBSCRIBE_DIR / "okx"     / "okx_futures.txt",
     "gate_spot":       SUBSCRIBE_DIR / "gate"    / "gate_spot.txt",
     "gate_futures":    SUBSCRIBE_DIR / "gate"    / "gate_futures.txt",
+    "bitget_spot":     SUBSCRIBE_DIR / "bitget"  / "bitget_spot.txt",
+    "bitget_futures":  SUBSCRIBE_DIR / "bitget"  / "bitget_futures.txt",
 }
 
 # ── Константа длительности WS-валидации ───────────────────────────────────────
@@ -283,12 +297,14 @@ def _fetch_all_exchanges() -> dict:
     from bybit.bybit_pairs     import fetch_pairs as bb_fetch
     from okx.okx_pairs         import fetch_pairs as okx_fetch
     from gate.gate_pairs       import fetch_pairs as gate_fetch
+    from bitget.bitget_pairs   import fetch_pairs as bg_fetch
 
     tasks = {
-        "bn":   bn_fetch,
-        "bb":   bb_fetch,
-        "okx":  okx_fetch,
-        "gate": gate_fetch,
+        "bn":     bn_fetch,
+        "bb":     bb_fetch,
+        "okx":    okx_fetch,
+        "gate":   gate_fetch,
+        "bitget": bg_fetch,
     }
 
     results = {}
@@ -318,6 +334,8 @@ async def _validate_all_exchanges(
     gate_fut_native: list,
     gate_spot_norm: list,
     gate_fut_norm: list,
+    bg_spot: list,
+    bg_fut: list,
     duration: int,
 ) -> tuple:
     """
@@ -353,39 +371,72 @@ async def _validate_all_exchanges(
         Нормализованные символы Gate.io Spot (``BTCUSDT``) для фильтрации.
     gate_fut_norm : list
         Нормализованные символы Gate.io Futures (``BTCUSDT``) для фильтрации.
+    bg_spot : list
+        Список пар Bitget Spot для валидации.
+    bg_fut : list
+        Список пар Bitget Futures для валидации.
     duration : int
         Длительность WS-окна наблюдения в секундах.
 
     Returns
     -------
     tuple
-        8-элементный кортеж активных списков::
+        10-элементный кортеж активных списков::
 
             (
                 abn_spot,  abn_fut,    # Binance
                 abb_spot,  abb_fut,    # Bybit
                 aokx_spot, aokx_fut,   # OKX
                 agate_spot, agate_fut, # Gate.io
+                abg_spot,  abg_fut,    # Bitget
             )
     """
     from binance.binance_ws import _run as bn_run
     from bybit.bybit_ws     import _run as bb_run
     from okx.okx_ws         import _run as okx_run
     from gate.gate_ws       import _run as gate_run
+    from bitget.bitget_ws   import _run as bg_run
 
     (
         (abn_spot, abn_fut),
         (abb_spot, abb_fut),
         (aokx_spot, aokx_fut),
         (agate_spot, agate_fut),
+        (abg_spot, abg_fut),
     ) = await asyncio.gather(
         bn_run(bn_spot, bn_fut, duration),
         bb_run(bb_spot, bb_fut, duration),
         okx_run(okx_spot_native, okx_fut_native, okx_spot_norm, okx_fut_norm, duration),
         gate_run(gate_spot_native, gate_fut_native, gate_spot_norm, gate_fut_norm, duration),
+        bg_run(bg_spot, bg_fut, duration),
     )
 
-    return abn_spot, abn_fut, abb_spot, abb_fut, aokx_spot, aokx_fut, agate_spot, agate_fut
+    return (abn_spot, abn_fut, abb_spot, abb_fut,
+            aokx_spot, aokx_fut, agate_spot, agate_fut,
+            abg_spot, abg_fut)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Symbol IDs
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _generate_symbol_ids() -> dict:
+    """
+    Собирает все уникальные символы из combination/*.txt,
+    сортирует и присваивает целочисленный ID (индекс в отсортированном списке).
+    Сохраняет результат в collectors/symbol_ids.json.
+    Возвращает словарь {symbol: id}.
+    """
+    symbols: set = set()
+    for f in COMBINATION_DIR.glob("*.txt"):
+        for line in f.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s:
+                symbols.add(s)
+    sym_ids = {sym: idx for idx, sym in enumerate(sorted(symbols))}
+    out_path = COLLECTORS_DIR / "symbol_ids.json"
+    out_path.write_text(json.dumps(sym_ids, indent=2, sort_keys=True), encoding="utf-8")
+    return sym_ids
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -412,7 +463,7 @@ def _print_report(r: dict, comb_counts: dict, sub_counts: dict, total_time: floa
     print("ИТОГОВЫЙ ОТЧЁТ")
     print(sep)
 
-    for exch, label in [("bn", "BINANCE"), ("bb", "BYBIT"), ("okx", "OKX"), ("gate", "GATE.IO")]:
+    for exch, label in [("bn", "BINANCE"), ("bb", "BYBIT"), ("okx", "OKX"), ("gate", "GATE.IO"), ("bg", "BITGET")]:
         st = r[f"{exch}_spot_total"]
         ft = r[f"{exch}_fut_total"]
         sa = r[f"{exch}_spot_active"]
@@ -480,6 +531,7 @@ def main() -> None:
     bb_spot,       bb_fut       = rest_results["bb"]
     okx_spot_norm, okx_fut_norm = rest_results["okx"]
     gate_spot_norm,gate_fut_norm= rest_results["gate"]
+    bg_spot,       bg_fut       = rest_results["bitget"]
 
     r["bn_spot_total"]   = len(bn_spot)
     r["bn_fut_total"]    = len(bn_fut)
@@ -489,11 +541,14 @@ def main() -> None:
     r["okx_fut_total"]   = len(okx_fut_norm)
     r["gate_spot_total"] = len(gate_spot_norm)
     r["gate_fut_total"]  = len(gate_fut_norm)
+    r["bg_spot_total"]   = len(bg_spot)
+    r["bg_fut_total"]    = len(bg_fut)
 
     print(f"       Binance  — Spot: {len(bn_spot)}, Futures: {len(bn_fut)}")
     print(f"       Bybit    — Spot: {len(bb_spot)}, Futures: {len(bb_fut)}")
     print(f"       OKX      — Spot: {len(okx_spot_norm)}, Futures: {len(okx_fut_norm)}")
     print(f"       Gate.io  — Spot: {len(gate_spot_norm)}, Futures: {len(gate_fut_norm)}")
+    print(f"       Bitget   — Spot: {len(bg_spot)}, Futures: {len(bg_fut)}")
     print(f"       Время REST: {time.time() - t_rest:.1f} сек")
 
     # Нативные символы OKX и Gate.io нужны для WS-подписки
@@ -509,12 +564,14 @@ def main() -> None:
         abb_spot,  abb_fut,
         aokx_spot, aokx_fut,
         agate_spot,agate_fut,
+        abg_spot,  abg_fut,
     ) = asyncio.run(
         _validate_all_exchanges(
             bn_spot,          bn_fut,
             bb_spot,          bb_fut,
             okx_spot_native,  okx_fut_native,  okx_spot_norm,  okx_fut_norm,
             gate_spot_native, gate_fut_native, gate_spot_norm, gate_fut_norm,
+            bg_spot,          bg_fut,
             DURATION_SECONDS,
         )
     )
@@ -527,11 +584,14 @@ def main() -> None:
     r["okx_fut_active"]   = len(aokx_fut)
     r["gate_spot_active"] = len(agate_spot)
     r["gate_fut_active"]  = len(agate_fut)
+    r["bg_spot_active"]   = len(abg_spot)
+    r["bg_fut_active"]    = len(abg_fut)
 
     print(f"       Binance  — Spot: {len(abn_spot)}/{len(bn_spot)}, Futures: {len(abn_fut)}/{len(bn_fut)}")
     print(f"       Bybit    — Spot: {len(abb_spot)}/{len(bb_spot)}, Futures: {len(abb_fut)}/{len(bb_fut)}")
     print(f"       OKX      — Spot: {len(aokx_spot)}/{len(okx_spot_norm)}, Futures: {len(aokx_fut)}/{len(okx_fut_norm)}")
     print(f"       Gate.io  — Spot: {len(agate_spot)}/{len(gate_spot_norm)}, Futures: {len(agate_fut)}/{len(gate_fut_norm)}")
+    print(f"       Bitget   — Spot: {len(abg_spot)}/{len(bg_spot)}, Futures: {len(abg_fut)}/{len(bg_fut)}")
     print(f"       Время WS: {time.time() - t_ws:.0f} сек")
 
     # ── Фаза 3: Пересечения ───────────────────────────────────────────────────
@@ -545,6 +605,8 @@ def main() -> None:
         "okx_futures":     aokx_fut,
         "gate_spot":       agate_spot,
         "gate_futures":    agate_fut,
+        "bitget_spot":     abg_spot,
+        "bitget_futures":  abg_fut,
     }
     comb_counts = _make_combinations(active)
     for fname, cnt in comb_counts.items():
@@ -555,6 +617,10 @@ def main() -> None:
     sub_counts = _make_subscribe_files()
     for key, cnt in sub_counts.items():
         print(f"        {cnt:4d} пар  {key}")
+
+    # ── Symbol IDs ────────────────────────────────────────────────────────────
+    sym_ids = _generate_symbol_ids()
+    print(f"\n[Symbol IDs] {len(sym_ids)} уникальных символов → collectors/symbol_ids.json")
 
     # ── Фаза 5: Отчёт ─────────────────────────────────────────────────────────
     _print_report(r, comb_counts, sub_counts, time.time() - t0)

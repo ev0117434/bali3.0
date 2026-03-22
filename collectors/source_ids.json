@@ -1,0 +1,13 @@
+{
+  "_comment": "Fixed source IDs for each exchange+market combination. DO NOT change existing IDs.",
+  "binance_spot":     0,
+  "binance_futures":  1,
+  "bybit_spot":       2,
+  "bybit_futures":    3,
+  "okx_spot":         4,
+  "okx_futures":      5,
+  "gate_spot":        6,
+  "gate_futures":     7,
+  "bitget_spot":      8,
+  "bitget_futures":   9
+}

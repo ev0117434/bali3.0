@@ -23,7 +23,7 @@ from pathlib import Path
 import orjson
 import redis.asyncio as aioredis
 
-from hist_writer import write_snapshot_history, SNAPSHOT_CSV_HEADER, OB_EMPTY, OB_LEVELS
+from hist_writer import write_snapshot_history, SNAPSHOT_CSV_HEADER, OB_EMPTY, OB_LEVELS, FR_EMPTY, SOURCE_IDS, SYMBOL_IDS
 
 SCRIPT = "spread_monitor"
 
@@ -50,6 +50,7 @@ EXCHANGE_CODE = {
     "bybit":   "bb",
     "okx":     "ok",
     "gate":    "gt",
+    "bitget":  "bg",
 }
 # Обратный маппинг для CSV (полное название)
 CODE_NAME = {v: k for k, v in EXCHANGE_CODE.items()}
@@ -73,6 +74,16 @@ def _format_ob(ob_dict: dict) -> str:
         parts.append(ob_dict.get(f"a{i}".encode(),  b"").decode())
         parts.append(ob_dict.get(f"aq{i}".encode(), b"").decode())
     return ",".join(parts)
+
+
+def _format_fr(fr_dict: dict) -> str:
+    """Convert fr HASH (bytes keys/values) to 3 CSV values: fr_r,fr_nr,fr_ft."""
+    if not fr_dict:
+        return FR_EMPTY
+    return (
+        f"{fr_dict.get(b'r',  b'').decode()},"
+        f"{fr_dict.get(b'ft', b'').decode()}"
+    )
 
 
 # ── logger ────────────────────────────────────────────────────────────────────
@@ -150,20 +161,26 @@ async def scan_cycle(
         for key, vals in zip(key_list, results)
     }
 
-    # Batch-fetch OB data for all pairs with active snapshots (one pipeline)
+    # Batch-fetch OB + FR data for all pairs with active snapshots (one pipeline)
     ob_cache: dict[bytes, dict] = {}
+    fr_cache: dict[bytes, dict] = {}
     if active_snapshots:
         snap_pairs = list(active_snapshots.keys())
         ob_keys: list[bytes] = []
+        fr_keys: list[bytes] = []
         for direction, sym in snap_pairs:
             spot_ex_s, fut_ex_s, _ = directions[direction]
             ob_keys.append(f"ob:{spot_ex_s}:s:{sym}".encode())
             ob_keys.append(f"ob:{fut_ex_s}:f:{sym}".encode())
+            fr_keys.append(f"fr:{fut_ex_s}:{sym}".encode())
         async with r.pipeline(transaction=False) as pipe:
             for k in ob_keys:
                 pipe.hgetall(k)
-            ob_results = await pipe.execute()
-        ob_cache = dict(zip(ob_keys, ob_results))
+            for k in fr_keys:
+                pipe.hgetall(k)
+            results = await pipe.execute()
+        ob_cache = dict(zip(ob_keys, results[:len(ob_keys)]))
+        fr_cache = dict(zip(fr_keys, results[len(ob_keys):]))
 
     for direction, (spot_ex, fut_ex, symbols) in directions.items():
         for sym in symbols:
@@ -203,8 +220,10 @@ async def scan_cycle(
             spread_r   = round(spread_pct, 4)
             spot_ask_s = spot_ask_b.decode()
             fut_bid_s  = fut_bid_b.decode()
-            spot_name  = CODE_NAME.get(spot_ex, spot_ex)
-            fut_name   = CODE_NAME.get(fut_ex,  fut_ex)
+            spot_name      = CODE_NAME.get(spot_ex, spot_ex)
+            fut_name       = CODE_NAME.get(fut_ex,  fut_ex)
+            spot_source_id = SOURCE_IDS.get(f"{spot_name}_spot",     -1)
+            fut_source_id  = SOURCE_IDS.get(f"{fut_name}_futures",   -1)
 
             # ── write to active snapshot (every cycle, regardless of threshold) ──
             snap_key = (direction, sym)
@@ -213,10 +232,11 @@ async def scan_cycle(
                 if now <= snap["expires"]:
                     s_ob = _format_ob(ob_cache.get(f"ob:{spot_ex}:s:{sym}".encode(), {}))
                     f_ob = _format_ob(ob_cache.get(f"ob:{fut_ex}:f:{sym}".encode(), {}))
+                    fr   = _format_fr(fr_cache.get(f"fr:{fut_ex}:{sym}".encode(), {}))
                     snap_row = (
-                        f"{spot_name},{fut_name},{sym},"
+                        f"{spot_source_id},{fut_source_id},{SYMBOL_IDS.get(sym, -1)},"
                         f"{spot_ask_s},{fut_bid_s},{spread_r},{now_ms},"
-                        f"{s_ob},{f_ob}\n"
+                        f"{s_ob},{f_ob},{fr}\n"
                     ).encode()
                     try:
                         snap["fh"].write(snap_row)
@@ -241,11 +261,12 @@ async def scan_cycle(
                 continue
 
             # ── fire signal ──
+            is_anomaly = spread_pct >= ANOMALY_THRESHOLD
             cooldowns[cd_key] = now + COOLDOWN_SEC
             counters["signals"] += 1
 
-            # ── open snapshot file ────────────────────────────────────────────
-            if snap_key not in active_snapshots:
+            # ── open snapshot file (anomalies skipped) ────────────────────────
+            if not is_anomaly and snap_key not in active_snapshots:
                 _now_utc  = datetime.now(timezone.utc)
                 _ts_str   = _now_utc.strftime('%Y%m%d_%H%M%S')
                 _snap_dir = SNAPSHOT_DIR / _now_utc.strftime('%Y-%m-%d') / _now_utc.strftime('%H')
@@ -256,7 +277,7 @@ async def scan_cycle(
                 _fh.flush()
                 # prepend 1-hour history (includes OB history)
                 hist_rows = await write_snapshot_history(
-                    r, _fh, spot_ex, fut_ex, sym, spot_name, fut_name)
+                    r, _fh, spot_ex, fut_ex, sym, spot_source_id, fut_source_id)
                 if hist_rows:
                     log("INFO", "snapshot_history_written",
                         direction=direction, symbol=sym, rows=hist_rows)
@@ -268,19 +289,19 @@ async def scan_cycle(
                     async with r.pipeline(transaction=False) as _pipe:
                         _pipe.hgetall(f"ob:{spot_ex}:s:{sym}".encode())
                         _pipe.hgetall(f"ob:{fut_ex}:f:{sym}".encode())
-                        _s_ob_raw, _f_ob_raw = await _pipe.execute()
+                        _pipe.hgetall(f"fr:{fut_ex}:{sym}".encode())
+                        _s_ob_raw, _f_ob_raw, _fr_raw = await _pipe.execute()
                     _s_ob = _format_ob(_s_ob_raw)
                     _f_ob = _format_ob(_f_ob_raw)
+                    _fr   = _format_fr(_fr_raw)
                     _fh.write((
-                        f"{spot_name},{fut_name},{sym},"
+                        f"{spot_source_id},{fut_source_id},{SYMBOL_IDS.get(sym, -1)},"
                         f"{spot_ask_s},{fut_bid_s},{spread_r},{now_ms},"
-                        f"{_s_ob},{_f_ob}\n"
+                        f"{_s_ob},{_f_ob},{_fr}\n"
                     ).encode())
                     _fh.flush()
                 except Exception:
                     pass
-
-            is_anomaly = spread_pct >= ANOMALY_THRESHOLD
 
             log("INFO", "anomaly" if is_anomaly else "signal",
                 direction=direction,

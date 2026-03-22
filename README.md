@@ -1,6 +1,6 @@
 # Bali 3.0
 
-Real-time market data collection and spread monitoring system for cryptocurrency arbitrage across 4 exchanges. Generates cross-exchange trading pair dictionaries, streams live best-bid/ask and full 10-level order books to Redis, monitors data freshness, and detects spread opportunities across 12 spot→futures directions.
+Real-time market data collection and spread monitoring system for cryptocurrency arbitrage across 4 exchanges. Generates cross-exchange trading pair dictionaries, streams live best-bid/ask prices, full 10-level order books, and funding rates to Redis, monitors data freshness, and detects spread opportunities across 12 spot→futures directions.
 
 ---
 
@@ -11,19 +11,22 @@ Real-time market data collection and spread monitoring system for cryptocurrency
 | **Dictionary Generator** | `dictionaries/main.py` | Discovers active trading pairs via REST + WebSocket validation | ~70s, run on demand |
 | **md collectors** (×8) | `binance/bybit/okx/gate_spot/futures.py` | Streams real-time best-bid/ask into Redis `md:*` keys | Continuous |
 | **ob collectors** (×8) | `ob_binance/bybit/okx/gate_spot/futures.py` | Streams real-time 10-level order books into Redis `ob:*` keys | Continuous |
+| **fr collectors** (×4) | `fr_binance/bybit/okx/gate_futures.py` | Streams funding rates into Redis `fr:*` keys | Continuous |
 | **Staleness Monitor** | `staleness_monitor.py` | Checks `md:*` key freshness every 60s, alerts on stale data | Continuous |
 | **Spread Monitor** | `spread_monitor.py` | Scans 12 spot→futures directions every 0.3s, writes signals + snapshots | Continuous |
+| **Redis Monitor** | `redis_monitor.py` | Monitors Redis latency, memory, OOM, slowlog every 5s | Continuous |
+| **Telegram Alerts** | `telegram_alert.py` | Sends Telegram notifications for signals, anomalies, crashes, Redis health | Continuous, optional |
 
 **Exchanges:** Binance · Bybit · OKX · Gate.io
 **Markets:** Spot + Futures (USDT/USDC perpetuals) for each exchange
-**Total collectors:** 16 (8 best-bid/ask + 8 order book)
+**Total data collectors:** 20 (8 md + 8 ob + 4 fr)
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- Redis (configured via `setup_redis.sh`)
+- Redis (configured via `setup_redis.sh`, recommended maxmemory ≥ 40 GB)
 
 ```bash
 pip install websockets orjson redis[hiredis] rich
@@ -54,54 +57,50 @@ cd dictionaries && python3 main.py && cd ..
 python3 run_all.py                  # live dashboard (default)
 python3 run_all.py --no-dash        # JSON logs only, no TUI
 python3 run_all.py --buckets        # + staleness age-bucket distribution
+python3 run_all.py --delay 60       # wait 60s before signals/snapshots start
 ```
 
-- Dashboard renders in terminal (stderr), updates every 2 seconds
-- JSON logs auto-written to `logs/collectors_YYYY-MM-DD_HH-MM.log` (12-hour chunks, keeps last 2)
-- Redis is flushed automatically on startup
-- Press `Ctrl+C` to stop
+On startup:
+- Archives previous `logs/` and `signals/` into `old/YYYY-MM-DD_HH-MM/`
+- Flushes Redis (SCAN + DEL all keys)
+- Starts all 20 collectors + 3 monitors simultaneously
+- Renders live dashboard in terminal (updates every 1 second)
+
+Press `Ctrl+C` to stop all processes cleanly.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                   Dictionary Generator                       │
-│                    dictionaries/main.py                      │
-│                                                             │
-│  Phase 1: REST fetch (parallel, ~3-5s)                     │
-│  Phase 2: WebSocket validation (parallel, 60s window)       │
-│  Phase 3: Build 12 intersection files (set ∩)               │
-│  Phase 4: Build 8 subscription files (set ∪)                │
-│  Phase 5: Print report                                      │
-└─────────────────────────────────────────────────────────────┘
-              ↓ subscribe/*.txt              ↓ combination/*.txt
-┌──────────────────────────────┐   ┌────────────────────────────────┐
-│   md collectors (×8)         │   │        Spread Monitor          │
-│   best-bid/ask → md:* keys   │   │    collectors/spread_monitor.py│
-│                              │   │                                │
-│   binance_spot               │   │  12 directions, 0.3s poll      │
-│   binance_futures            │   │  (futures_bid-spot_ask)/ask    │
-│   bybit_spot             →Redis  │  signals/signals.jsonl+csv     │
-│   bybit_futures          md:*:*  │  signals/anomalies.jsonl+csv   │
-│   okx_spot                   │   └────────────────────────────────┘
-│   okx_futures                │
-│   gate_spot                  │   ┌────────────────────────────────┐
-│   gate_futures               │   │      Staleness Monitor         │
-│                              │   │  checks md:* keys every 60s    │
-│   ob collectors (×8)         │   └────────────────────────────────┘
-│   10-level book → ob:* keys  │
-│                          →Redis
-│   ob_binance_spot        ob:*:*
-│   ob_binance_futures         │
-│   ob_bybit_spot              │
-│   ob_bybit_futures           │
-│   ob_okx_spot                │
-│   ob_okx_futures             │
-│   ob_gate_spot               │
-│   ob_gate_futures            │
-└──────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│                    Dictionary Generator                     │
+│                    dictionaries/main.py                     │
+│                                                            │
+│  Phase 1: REST API fetch from all 4 exchanges (parallel)  │
+│  Phase 2: WebSocket validation, 60s window (parallel)      │
+│  Phase 3: Build 12 intersection files (combination/)       │
+│  Phase 4: Build 8 subscription files (subscribe/)          │
+│  Phase 5: Print report                                     │
+└────────────────────────────────────────────────────────────┘
+          ↓ subscribe/*.txt                ↓ combination/*.txt
+┌──────────────────────────┐   ┌──────────────────────────────┐
+│   md collectors (×8)     │   │       Spread Monitor         │
+│   best-bid/ask → md:*    │   │   collectors/spread_monitor  │
+│                          │   │                              │
+│   ob collectors (×8)  →Redis  12 directions, 0.3s poll     │
+│   10-level OB → ob:*  md:*:*  signals/signals.jsonl+csv    │
+│                       ob:*:*  signals/anomalies.jsonl+csv  │
+│   fr collectors (×4)  fr:*:*  signals/snapshots/*.csv      │
+│   funding rate → fr:* │   └──────────────────────────────────┘
+└──────────────────────────┘
+                              ┌──────────────────────────────┐
+                              │      Staleness Monitor       │
+                              │  checks md:* keys every 60s  │
+                              ├──────────────────────────────┤
+                              │      Redis Monitor           │
+                              │  latency + memory every 5s   │
+                              └──────────────────────────────┘
 ```
 
 ### Data flow
@@ -111,8 +110,10 @@ REST API → pairs list → WS validation → active pairs
     → intersections (12 files) → subscribe files (8 files)
         → md collectors  → Redis HASH md:*  + ZSET md:hist:*
         → ob collectors  → Redis HASH ob:*  + ZSET ob:hist:*
-            → spread_monitor reads md:* → signals files
+        → fr collectors  → Redis HASH fr:*  + ZSET fr:hist:*
+            → spread_monitor reads md:*, ob:* → signals + snapshots
             → staleness_monitor scans md:* for stale keys
+            → redis_monitor checks Redis health
 ```
 
 ---
@@ -121,7 +122,7 @@ REST API → pairs list → WS validation → active pairs
 
 ```
 bali3.0/
-├── run_all.py                           # Orchestrator: all 16 collectors + monitors + dashboard
+├── run_all.py                           # Orchestrator: 20 collectors + monitors + dashboard
 ├── setup_redis.sh                       # Redis install & configuration
 ├── CLAUDE.md                            # Project notes for AI assistant
 │
@@ -133,42 +134,28 @@ bali3.0/
 │   ├── signals.csv                      # Same, CSV format
 │   ├── anomalies.jsonl                  # Anomalies (spread ≥100%)
 │   ├── anomalies.csv                    # Same, CSV format
-│   └── snapshots/YYYY-MM-DD/HH/        # Per-signal spread evolution (3500s window)
-│       └── {spot}_{fut}_{sym}_{ts}.csv
+│   ├── snapshots/YYYY-MM-DD/HH/        # Per-signal spread evolution (3500s window)
+│   │   └── {spot}_{fut}_{sym}_{YYYYMMDD_HHMMSS}.csv  # 89 columns: base + spot OB + fut OB + fr
+│   ├── ml_dataset.csv                  # ML features (output of enrich_snapshot.py)
+│   └── signal_history.db               # SQLite: per-pair signal history (enrich_snapshot.py)
 │
 ├── old/
-│   └── YYYY-MM-DD_HH-MM/              # Archived from previous run
+│   └── YYYY-MM-DD_HH-MM/               # Archived from previous run
 │       ├── logs/
 │       └── signals/
 │
 ├── dictionaries/
 │   ├── main.py                          # Dictionary generator (5 phases)
-│   ├── binance/
-│   │   ├── binance_pairs.py             # REST: api.binance.com / fapi.binance.com
-│   │   ├── binance_ws.py                # WS: stream.binance.com:9443, bookTicker
-│   │   └── data/                        # Raw and active pair lists
-│   ├── bybit/
-│   │   ├── bybit_pairs.py               # REST: api.bybit.com/v5/market/instruments-info
-│   │   ├── bybit_ws.py                  # WS: stream.bybit.com/v5/public, orderbook.1
-│   │   └── data/
-│   ├── okx/
-│   │   ├── okx_pairs.py                 # REST: okx.com/api/v5/public/instruments
-│   │   ├── okx_ws.py                    # WS: ws.okx.com:8443/ws/v5/public, tickers
-│   │   └── data/                        # Includes *_native.txt (BTC-USDT[-SWAP])
-│   ├── gate/
-│   │   ├── gate_pairs.py                # REST: api.gateio.ws/api/v4
-│   │   ├── gate_ws.py                   # WS: api.gateio.ws / fx-ws.gateio.ws
-│   │   └── data/                        # Includes *_native.txt (BTC_USDT)
+│   ├── binance/ bybit/ okx/ gate/       # pairs.py + ws.py + data/
 │   ├── combination/                     # 12 intersection files: spot_A ∩ futures_B
 │   └── subscribe/                       # 8 subscription files: input for collectors
-│       ├── binance/{spot,futures}.txt
-│       ├── bybit/{spot,futures}.txt
-│       ├── okx/{spot,futures}.txt
-│       └── gate/{spot,futures}.txt
 │
 └── collectors/
-    ├── hist_writer.py                   # md:hist history module (20-min ZSET chunks)
-    ├── ob_hist_writer.py                # ob:hist history module (same logic, 41-field member)
+    ├── hist_writer.py                   # md:hist + snapshot history + OB/FR history reader
+    ├── ob_hist_writer.py                # ob:hist history module
+    ├── fr_hist_writer.py                # fr:hist history module + read_fr_history()
+    ├── source_ids.json                  # Fixed integer IDs for 8 exchange+market sources
+    ├── enrich_snapshot.py               # ML dataset generator from snapshot CSVs
     │
     ├── binance_spot.py                  # md: Binance Spot best-bid/ask
     ├── binance_futures.py               # md: Binance Futures best-bid/ask
@@ -181,492 +168,205 @@ bali3.0/
     │
     ├── ob_binance_spot.py               # ob: Binance Spot 10-level order book
     ├── ob_binance_futures.py            # ob: Binance Futures 10-level order book
-    ├── ob_bybit_spot.py                 # ob: Bybit Spot 10-level order book (local book)
-    ├── ob_bybit_futures.py              # ob: Bybit Futures 10-level order book (local book)
-    ├── ob_okx_spot.py                   # ob: OKX Spot 10-level order book (local book)
-    ├── ob_okx_futures.py                # ob: OKX Futures 10-level order book (local book)
+    ├── ob_bybit_spot.py                 # ob: Bybit Spot 10-level order book
+    ├── ob_bybit_futures.py              # ob: Bybit Futures 10-level order book
+    ├── ob_okx_spot.py                   # ob: OKX Spot 10-level order book
+    ├── ob_okx_futures.py                # ob: OKX Futures 10-level order book
     ├── ob_gate_spot.py                  # ob: Gate.io Spot 10-level order book
     ├── ob_gate_futures.py               # ob: Gate.io Futures 10-level order book
     │
-    ├── staleness_monitor.py             # Monitors md:* key freshness
-    └── spread_monitor.py                # Detects cross-exchange spread opportunities
+    ├── fr_binance_futures.py            # fr: Binance funding rates (stream !markPrice@arr@1s)
+    ├── fr_bybit_futures.py              # fr: Bybit funding rates (tickers channel, delta cache)
+    ├── fr_okx_futures.py                # fr: OKX funding rates (WS + REST fallback every 30s)
+    ├── fr_gate_futures.py               # fr: Gate.io funding rates (WS + REST fallback + contracts loop every 5m)
+    │
+    ├── staleness_monitor.py             # Monitors md:* key freshness (threshold: 300s)
+    ├── spread_monitor.py                # Detects cross-exchange spread opportunities
+    ├── redis_monitor.py                 # Monitors Redis health (latency, memory, OOM)
+    ├── telegram_alert.py                # Telegram notifications (requires alert_config.json)
+    └── alert_config.json                # Alert config: bot_token, chat_id, thresholds
 ```
 
 ---
 
-## run_all.py
+## Redis Key Schema
 
-Single entry point for all components. On startup:
-1. Archives `logs/` and `signals/` to `old/YYYY-MM-DD_HH-MM/` (skipped if empty)
-2. Flushes Redis (SCAN + DEL all keys)
-3. Prompts: `Delay before signals/snapshots [seconds, Enter = 0]:` (stdin tty only; non-interactive defaults to 0)
-4. Starts all 16 collectors + staleness_monitor immediately
-5. Starts spread_monitor after the specified delay (0 = immediately)
-
-```bash
-python3 run_all.py                  # dashboard + auto log file
-python3 run_all.py --buckets        # + staleness age-bucket distribution in logs
-python3 run_all.py --no-dash        # JSON logs only, no TUI
-```
-
-In non-interactive mode (e.g. redirected stdin), the delay prompt is auto-skipped and defaults to 0.
-
-Previous runs' logs and signals accumulate under `old/` as `old/YYYY-MM-DD_HH-MM/logs/` and `old/YYYY-MM-DD_HH-MM/signals/`.
-
-### Log rotation
-
-Files rotate every 12 hours automatically. Only last 2 files are kept (last 24 hours):
+### md — best bid/ask (current)
 
 ```
-logs/collectors_2026-03-20_14-00.log   ← previous chunk
-logs/collectors_2026-03-21_02-00.log   ← current chunk
+md:{ex}:{mkt}:{symbol}                  →  HASH    b=bid, a=ask, t=ts_ms
+md:hist:{ex}:{mkt}:{symbol}:{chunk_id}  →  ZSET    member: bid|ask|ts_ms  score: ts_ms
+md:hist:config                          →  STRING   JSON chunk metadata
 ```
 
----
-
-## md Collectors — best-bid/ask
-
-8 collectors that stream real-time best bid and best ask prices from exchange WebSocket feeds.
-
-### Redis key schema (md)
+### ob — order book 10 levels
 
 ```
-md:{ex}:{mkt}:{symbol}                  →  HASH   (current best bid/ask)
-md:hist:{ex}:{mkt}:{symbol}:{chunk_id}  →  ZSET   (1-hour price history, 20-min chunks)
-md:hist:config                          →  STRING  (JSON, active chunk metadata)
+ob:{ex}:{mkt}:{symbol}                  →  HASH    41 fields: b1–b10, bq1–bq10, a1–a10, aq1–aq10, t
+ob:hist:{ex}:{mkt}:{symbol}:{chunk_id}  →  ZSET    member: b1|bq1|...|b10|bq10|a1|aq1|...|a10|aq10|ts_ms
+ob:hist:config                          →  STRING   JSON chunk metadata
 ```
 
-**HASH fields:** `b` = best bid · `a` = best ask · `t` = timestamp ms
+### fr — funding rates
 
-**ZSET member format:** `{bid}|{ask}|{ts_ms}` · **score:** `ts_ms`
+```
+fr:{ex}:{symbol}                        →  HASH    r=rate, nr=next predicted, ft=next funding time ms, ts=recv ms
+fr:hist:{ex}:{symbol}:{chunk_id}        →  ZSET    member: r|nr|ft|ts_ms  score: ts_ms
+fr:hist:config                          →  STRING   JSON chunk metadata
+```
 
 **Exchange codes:** `bn` = Binance · `bb` = Bybit · `ok` = OKX · `gt` = Gate.io
 **Market codes:** `s` = spot · `f` = futures
-
-**Examples:**
-```
-md:bn:s:BTCUSDT              → Binance Spot BTC/USDT (current)
-md:hist:bn:s:BTCUSDT:1450782 → Binance Spot BTC/USDT history chunk 1450782
-md:ok:f:BTCUSDT              → OKX Futures BTC/USDT (current)
-```
-
-### WebSocket protocol details (md collectors)
-
-| Collector | Endpoint | Channel | Ping | Chunk |
-|-----------|----------|---------|------|-------|
-| binance_spot | `stream.binance.com:9443/stream` | `{sym}@bookTicker` | Built-in 20s | 300 syms/conn |
-| binance_futures | `fstream.binance.com/stream` | `{sym}@bookTicker` | Built-in 20s | 300 syms/conn |
-| bybit_spot | `stream.bybit.com/v5/public/spot` | `orderbook.1.{SYM}` | `{"op":"ping"}` 20s | single conn, 10/batch |
-| bybit_futures | `stream.bybit.com/v5/public/linear` | `orderbook.1.{SYM}` | `{"op":"ping"}` 20s | single conn, 200/batch |
-| okx_spot | `ws.okx.com:8443/ws/v5/public` | `tickers` instId | `"ping"` 25s | 300 syms/conn, 20/batch |
-| okx_futures | `ws.okx.com:8443/ws/v5/public` | `tickers` instId | `"ping"` 25s | 300 syms/conn, 20/batch |
-| gate_spot | `api.gateio.ws/ws/v4/` | `spot.book_ticker` | timestamped JSON 20s | single conn, 1 sub/sym |
-| gate_futures | `fx-ws.gateio.ws/v4/ws/usdt` | `futures.book_ticker` | timestamped JSON 20s | single conn, 1 sub/sym |
-
-### md collector log events
-
-| Event | Level | Key fields |
-|-------|-------|-----------|
-| `startup` | INFO | — |
-| `symbols_loaded` | INFO | `count`, `file` |
-| `redis_connected` | INFO | `socket` |
-| `subscribing` | INFO | `total_symbols`, `connections` |
-| `connecting` | INFO | `chunk_symbols` |
-| `connected` | INFO | `chunk_symbols` |
-| `subscribed` | INFO | `total_symbols` or `chunk_symbols`, `subscribe_ms` |
-| `first_message` | INFO | `ms_since_connected`, `first_sym` |
-| `stats` | INFO | `msgs_total`, `msgs_per_sec`, `flushes_total`, `avg_pipeline_ms` |
-| `disconnected` | WARN | `reason` |
-| `reconnecting` | INFO | `delay_sec` |
+**History:** 20-min chunks, 4 chunks kept (80-min window, always covers last hour), throttle 1 write/sec/symbol
 
 ---
 
-## ob Collectors — 10-level order books
+## Signals
 
-8 collectors that maintain real-time 10-level order books (10 bid levels + 10 ask levels, each with price and quantity).
+### Signal files
 
-### Local book management
+| File | Content |
+|------|---------|
+| `signals/signals.jsonl` | Normal signals (spread 1%–99%) |
+| `signals/signals.csv` | Same, CSV |
+| `signals/anomalies.jsonl` | Anomalies (spread ≥100%) |
+| `signals/anomalies.csv` | Same, CSV |
 
-Three of the four exchanges send **incremental updates** after an initial snapshot. These collectors maintain a local order book dictionary in memory:
+### Signal JSONL format
 
-- **Bybit** (`snapshot` → `delta`): `books[sym] = {"bids": {price: qty}, "asks": {price: qty}}`. Cleared on reconnect. Logs `book_init` on first snapshot per symbol, `delta_before_snapshot` WARN if delta arrives out of order.
-- **OKX** (`snapshot` → `update`): Same pattern. Multiple parallel connections (chunks of 150 instIds). On reconnect, only that chunk's books are cleared. Logs `book_init` and `update_before_snapshot` WARN.
-- **Binance** and **Gate.io**: Full snapshot every 100ms — no local book needed.
-
-### Redis key schema (ob)
-
-```
-ob:{ex}:{mkt}:{symbol}                  →  HASH   (current 10-level order book)
-ob:hist:{ex}:{mkt}:{symbol}:{chunk_id}  →  ZSET   (order book history, 20-min chunks)
-ob:hist:config                          →  STRING  (JSON, active chunk metadata)
-```
-
-**HASH fields (41 total):**
-
-| Field | Description |
-|-------|-------------|
-| `b1`..`b10` | Bid prices, level 1 (best) to 10 (worst) |
-| `bq1`..`bq10` | Bid quantities for each level |
-| `a1`..`a10` | Ask prices, level 1 (best) to 10 (worst) |
-| `aq1`..`aq10` | Ask quantities for each level |
-| `t` | Timestamp ms (exchange timestamp where available, else local) |
-
-**ZSET member format (pipe-separated, 41 values):**
-```
-b1|bq1|b2|bq2|...|b10|bq10|a1|aq1|...|a10|aq10|ts_ms
-```
-**score:** `ts_ms`
-
-**Examples:**
-```
-ob:bn:s:BTCUSDT               → Binance Spot BTC/USDT order book (current)
-ob:hist:bb:f:ETHUSDT:1478370  → Bybit Futures ETH/USDT OB history chunk 1478370
-ob:ok:f:BTCUSDT               → OKX Futures BTC/USDT order book (current)
-```
-
-### Query order book
-
-```bash
-# Get full order book for a symbol
-redis-cli -s /var/run/redis/redis.sock HGETALL ob:bn:s:BTCUSDT
-
-# Get just top 3 bids and asks
-redis-cli -s /var/run/redis/redis.sock HMGET ob:bn:s:BTCUSDT b1 bq1 b2 bq2 b3 bq3 a1 aq1 a2 aq2 a3 aq3
-
-# Check data age
-T=$(redis-cli -s /var/run/redis/redis.sock HGET ob:bn:s:BTCUSDT t)
-echo "Age: $(( ($(date +%s%3N) - T) / 1000 ))ms"
-```
-
-### WebSocket protocol details (ob collectors)
-
-| Collector | Endpoint | Channel | Depth | Book type | Ping |
-|-----------|----------|---------|-------|-----------|------|
-| ob_binance_spot | `stream.binance.com:9443/stream` | `{sym}@depth10@100ms` | Full snap 100ms | No local book | Built-in 20s |
-| ob_binance_futures | `fstream.binance.com/stream` | `{sym}@depth10@100ms` | Full snap 100ms | No local book | Built-in 20s |
-| ob_bybit_spot | `stream.bybit.com/v5/public/spot` | `orderbook.50.{SYM}` | snap+delta, top-10 | Local book | `{"op":"ping"}` 20s |
-| ob_bybit_futures | `stream.bybit.com/v5/public/linear` | `orderbook.50.{SYM}` | snap+delta, top-10 | Local book | `{"op":"ping"}` 20s |
-| ob_okx_spot | `ws.okx.com:8443/ws/v5/public` | `books` instId | snap+update, top-10 | Local book | `"ping"` 25s |
-| ob_okx_futures | `ws.okx.com:8443/ws/v5/public` | `books` instId | snap+update, top-10 | Local book | `"ping"` 25s |
-| ob_gate_spot | `api.gateio.ws/ws/v4/` | `spot.order_book` | Full snap 100ms | No local book | timestamped JSON 20s |
-| ob_gate_futures | `fx-ws.gateio.ws/v4/ws/usdt` | `futures.order_book` | Full snap realtime | No local book | timestamped JSON 20s |
-
-**Important protocol notes:**
-- **Binance Futures** depth messages use fields `b`/`a` (NOT `bids`/`asks` like spot)
-- **Bybit** supports depths 1, 50, 200 (spot) and 1, 50, 200, 500 (futures). `orderbook.10` does not exist
-- **OKX** `books` channel sends full-depth book (400 levels), top 10 extracted locally
-- **Gate.io Futures** interval must be `"0"` (realtime); `"100ms"` is rejected by the endpoint
-
-### ob collector log events
-
-| Event | Level | Key fields | When |
-|-------|-------|-----------|------|
-| `startup` | INFO | — | Script start |
-| `symbols_loaded` | INFO | `count`, `file` | After reading subscribe file |
-| `redis_connected` | INFO | `socket` | After Redis connect |
-| `subscribing` | INFO | `total_symbols`, `connections` | Before spawning chunk tasks |
-| `connecting` | INFO | `chunk_symbols` | Each WS connect attempt |
-| `connected` | INFO | `chunk_symbols` | WS handshake complete |
-| `subscribing_progress` | INFO | `subscribed`, `total`, `elapsed_ms` | Gate only: every 100 symbols |
-| `subscribed` | INFO | `total_symbols`, `subscribe_ms` | All subs sent |
-| `book_init` | INFO | `symbol`, `bid_levels`, `ask_levels`, `books_initialized` | Bybit/OKX: first snapshot per symbol |
-| `first_message` | INFO | `ms_since_connected`, `first_sym` | First data written to Redis |
-| `delta_before_snapshot` | WARN | `symbol`, `delta_skipped_total` | Bybit: delta arrived before snapshot |
-| `update_before_snapshot` | WARN | `symbol`, `update_skipped_total` | OKX: update arrived before snapshot |
-| `stats` | INFO | see below | Every 30s |
-| `disconnected` | WARN | `reason` | Connection lost |
-| `reconnecting` | INFO | `delay_sec` | Before reconnect sleep |
-
-**stats event fields (ob collectors):**
-
-| Field | Description | Bybit/OKX only |
-|-------|-------------|----------------|
-| `msgs_total` | Total order book updates written to Redis | |
-| `msgs_per_sec` | Rate in last 30s interval | |
-| `flushes_total` | Redis pipeline batches executed | |
-| `avg_pipeline_ms` | Average pipeline latency | |
-| `avg_levels` | Average number of levels actually present (expect ≈10.0) | |
-| `shallow_warnings` | Times a flush had < 10 levels on either side | |
-| `books_initialized` | Current number of symbols with a live local book | ✓ |
-| `snapshots_total` | Total initial snapshot messages received | ✓ |
-| `deltas_total` / `updates_total` | Total incremental messages received | ✓ |
-| `delta_skipped` / `update_skipped` | Incremental messages dropped (no snapshot yet) | ✓ |
-
----
-
-## History Writers
-
-Both `hist_writer.py` (md) and `ob_hist_writer.py` (ob) share the same chunking design:
-
-- **Chunk size:** 20 minutes (`chunk_id = int(unix_sec // 1200)`)
-- **Chunks kept:** 4 (80-minute window, always covers last 60 minutes)
-- **Throttle:** max 1 sample per second per symbol
-- **Rotation:** when chunk 5 starts, chunk 1 is deleted in the same pipeline batch — no extra round-trips
-- **Config key:** written once on startup and once per rotation, only when dirty
-
-### md history member format
-```
-{bid}|{ask}|{ts_ms}
-```
-
-### ob history member format (41 pipe-separated values)
-```
-b1|bq1|b2|bq2|b3|bq3|b4|bq4|b5|bq5|b6|bq6|b7|bq7|b8|bq8|b9|bq9|b10|bq10|a1|aq1|a2|aq2|a3|aq3|a4|aq4|a5|aq5|a6|aq6|a7|aq7|a8|aq8|a9|aq9|a10|aq10|ts_ms
-```
-
-### Query history
-
-```bash
-# Get current chunk_id
-CID=$(python3 -c "import time; print(int(time.time()//1200))")
-
-# Read md history for last hour (all 4 chunks)
-for i in 3 2 1 0; do
-  redis-cli -s /var/run/redis/redis.sock \
-    ZRANGEBYSCORE "md:hist:bn:s:BTCUSDT:$((CID - i))" \
-    "$(($(date +%s%3N) - 3600000))" "+inf"
-done
-
-# Read ob history for last hour
-for i in 3 2 1 0; do
-  redis-cli -s /var/run/redis/redis.sock \
-    ZRANGEBYSCORE "ob:hist:bn:s:BTCUSDT:$((CID - i))" \
-    "$(($(date +%s%3N) - 3600000))" "+inf"
-done
-
-# Check config
-redis-cli -s /var/run/redis/redis.sock GET md:hist:config | python3 -m json.tool
-redis-cli -s /var/run/redis/redis.sock GET ob:hist:config | python3 -m json.tool
-```
-
----
-
-## Staleness Monitor
-
-Scans all `md:*` keys in Redis every 60 seconds. A key is stale if its `t` field hasn't been updated in more than 300 seconds.
-
-```bash
-python3 collectors/staleness_monitor.py              # stale alerts only
-python3 collectors/staleness_monitor.py --buckets    # + 1-min age distribution
-```
-
-### Log events
-
-| Event | Level | Key fields |
-|-------|-------|-----------|
-| `startup` | INFO | `check_interval_sec`, `stale_threshold_sec`, `with_buckets` |
-| `redis_connected` | INFO | `socket` |
-| `check_start` | INFO | `cycle`, `pattern` |
-| `scan_complete` | INFO | `cycle`, `keys_found`, `scan_ms` |
-| `fetch_complete` | INFO | `cycle`, `keys_fetched`, `fetch_ms` |
-| `check` | INFO/WARN | `total_keys`, `keys_with_ts`, `stale_count`, `stale_by_source`, `top_stale` |
-| `buckets` | INFO | `distribution` (fresh, 1-2min, 2-3min, 3-4min, 4-5min, 5+min) |
-| `check_complete` | INFO | `cycle`, `total_ms` |
-| `check_failed` | ERROR | `cycle`, `reason` |
-| `stopped` | INFO | — |
-
----
-
-## Spread Monitor
-
-Reads Redis every 0.3 seconds across all 12 spot→futures directions. Generates a signal when spread exceeds the threshold and no cooldown is active.
-
-### Spread formula
-
-```
-spread = (futures_bid - spot_ask) / spot_ask × 100
-```
-
-### 12 directions
-
-```
-binance_spot  × bybit_futures,  okx_futures,  gate_futures
-bybit_spot    × binance_futures, okx_futures,  gate_futures
-okx_spot      × binance_futures, bybit_futures, gate_futures
-gate_spot     × binance_futures, bybit_futures, okx_futures
-```
-
-### Signal thresholds
-
-| Range | Output file |
-|-------|-------------|
-| 1.0% – 99.99% | `signals/signals.jsonl` + `signals/signals.csv` |
-| ≥ 100% | `signals/anomalies.jsonl` + `signals/anomalies.csv` |
-
-### Signal file formats
-
-**JSONL:**
 ```json
-{"ts": 1711234567.1, "direction": "binance_spot_bybit_futures", "symbol": "BTCUSDT",
- "spread_pct": 1.42, "spot_ask": "67234.10", "fut_bid": "68189.20",
- "spot_ex": "bn", "fut_ex": "bb", "cooldown_until": 1711238067}
+{
+  "ts": 1774090954.48,
+  "direction": "gate_spot_bybit_futures",
+  "symbol": "VANRYUSDT",
+  "spread_pct": 7.8494,
+  "spot_ask": "0.005631",
+  "fut_bid": "0.006073",
+  "spot_ex": "gt",
+  "fut_ex": "bb"
+}
 ```
 
-**CSV:**
+### Snapshot CSV (89 columns)
+
+Each signal opens a snapshot file written every 0.3s for 3500s (≈2500 rows), capturing spread evolution.
+At the moment of signal, 1 hour of historical data is prepended (also 89 columns).
+
 ```
-spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
-binance,bybit,BTCUSDT,67234.10,68189.20,1.4200,1711234567123
+spot_source_id, fut_source_id, symbol, ask_spot, bid_futures, spread_pct, ts,  ← 7 base columns
+s_b1..s_b10, s_bq1..s_bq10, s_a1..s_a10, s_aq1..s_aq10,                      ← 40 spot OB columns
+f_b1..f_b10, f_bq1..f_bq10, f_a1..f_a10, f_aq1..f_aq10,                      ← 40 futures OB columns
+fr_r, fr_ft                                                                     ← 2 FR columns
 ```
 
-Both files append across restarts. CSV header is written only on first creation.
+Total: **89 columns** = 7 base + 40 spot OB + 40 futures OB + 2 FR.
 
-### Snapshots
-
-On every signal, a snapshot CSV opens at `signals/snapshots/YYYY-MM-DD/HH/{spot}_{fut}_{sym}_{ts}.csv`. It starts with up to 3600 historical rows (last 1 hour from `md:hist:*`), then appends live rows at 0.3s for the full 3500s cooldown window.
-
-**CSV columns (87 total):**
-- 7 base columns: `ts`, `spread_pct`, `spot_ask`, `fut_bid`, `symbol`, `spot_ex`, `fut_ex`
-- 40 spot order book columns: `s_b1`..`s_b10`, `s_bq1`..`s_bq10`, `s_a1`..`s_a10`, `s_aq1`..`s_aq10`
-- 40 futures order book columns: `f_b1`..`f_b10`, `f_bq1`..`f_bq10`, `f_a1`..`f_a10`, `f_aq1`..`f_aq10`
-
-Historical rows (prepended from `md:hist:*`) include corresponding `ob:hist:*` data joined by `ts_sec`. Seconds with no OB history entry get empty fields for the 80 OB columns. Live rows include `ob:*` HASH data fetched in a batch pipeline at each 0.3s cycle.
-
-### Cooldown
-
-After a signal fires for `(direction, symbol)`, no new signal is written for that pair for **3500 seconds**. Cooldowns are in-memory and reset on restart.
-
-### Data freshness guard
-
-If either spot or futures price is older than 300 seconds, the pair is skipped entirely.
-
-### Log events
-
-| Event | Level | Key fields |
-|-------|-------|-----------|
-| `startup` | INFO | `poll_interval_sec`, `min_spread_pct`, `cooldown_sec` |
-| `directions_loaded` | INFO | `directions`, `total_symbols` |
-| `direction_loaded` | INFO | `direction`, `symbols`, `spot_ex`, `fut_ex` |
-| `redis_connected` | INFO | `socket` |
-| `signal_files_opened` | INFO | file paths, `anomaly_threshold_pct` |
-| `signal` | INFO | `direction`, `symbol`, `spread_pct`, `spot_ask`, `fut_bid`, `cooldown_until` |
-| `anomaly` | INFO | same as `signal` |
-| `snapshot_opened` | INFO | `direction`, `symbol`, `file`, `duration_sec` |
-| `snapshot_history_written` | INFO | `direction`, `symbol`, `rows` |
-| `stats` | INFO | `signals_total`, `anomalies_total`, `cooldowns_active`, `snapshots_active`, `last_cycle_ms` |
-| `cycle_error` | ERROR | `reason` |
+`spot_source_id`/`fut_source_id` are integer IDs (from `collectors/source_ids.json`):
+`binance_spot=0, binance_futures=1, bybit_spot=2, bybit_futures=3, okx_spot=4, okx_futures=5, gate_spot=6, gate_futures=7`
 
 ---
 
-## Dashboard
+## Funding Rate Collectors
 
-Updates every 2 seconds in terminal (stderr). JSON logs go to rotating files simultaneously.
-
-```
-Bali 3.0  uptime 120s  log collectors_2026-03-20_14-00.log
-┌──────────────────────────┬───────────┬────────┬───────────┬─────────┬─────────┬────────┬──────────┐
-│ Script                   │ Status    │ msgs/s │ total     │ flushes │ pipe ms │ errors │ last seen│
-├──────────────────────────┼───────────┼────────┼───────────┼─────────┼─────────┼────────┼──────────┤
-│ binance_spot             │ streaming │  963.1 │ 605,069   │  6,030  │  7.777  │   0    │     1s   │
-│ ...                      │           │        │           │         │         │        │          │
-│ ob_binance_spot          │ streaming │  560.9 │ 361,157   │  3,611  │  7.418  │   0    │     1s   │
-│ ob_bybit_futures         │ streaming │ 3028.6 │1,776,870  │ 17,769  │  7.844  │   0    │     1s   │
-│ ...                      │           │        │           │         │         │        │          │
-├──────────────────────────┼───────────┼────────┼───────────┼─────────┼─────────┼────────┼──────────┤
-│ staleness_monitor        │ ok        │   —    │ 2,933     │ stale:0 │    —    │   0    │    12s   │
-├──────────────────────────┼───────────┼────────┼───────────┼─────────┼─────────┼────────┼──────────┤
-│ spread_monitor           │ wait:300s │   —    │  —        │   —     │   —     │   0    │     1s   │
-└──────────────────────────┴───────────┴────────┴───────────┴─────────┴─────────┴─────────┴─────────┘
-```
-
-**Status colors:** `streaming/scanning/ok` = green · `connecting/reconnecting/wait:Ns` = yellow · `disconnected/STALE:N` = red · `CRASHED` = bold red
-
-`wait:Ns` means spread_monitor is waiting for the startup delay to expire (N seconds remaining).
-
-**spread_monitor columns:** `msgs/s` = signals/30s · `total` = total signals · `flushes` = `cd:N` active cooldowns · `pipe ms` = last cycle ms · shows `wait:Ns` status before the delay expires
+| Collector | Method | Update frequency | Notes |
+|-----------|--------|-----------------|-------|
+| `fr_binance_futures` | WS stream `!markPrice@arr@1s` | Every 1s | Single stream for all symbols, reconnects before 23h forced close |
+| `fr_bybit_futures` | WS `tickers` channel | On change | Delta cache pattern, persists across reconnects |
+| `fr_okx_futures` | WS `funding-rate` + REST fallback | On change + every 30s | WS pushes ~every 30 min; REST guarantees freshness |
+| `fr_gate_futures` | WS `futures.tickers` + REST fallback + contracts loop | On change + every 30s (rates) / every 5m (ft) | REST fetches all symbols in one call; contracts loop fills `ft` field |
 
 ---
 
-## Redis
+## WebSocket Protocol Summary
 
-### Configuration
+### md collectors
 
-```
-Socket:      /var/run/redis/redis.sock
-Eviction:    volatile-ttl
-Persistence: disabled
-FLUSHDB:     disabled (security) — run_all.py uses SCAN+DEL on startup
-```
+| Collector | Endpoint | Channel | Ping |
+|-----------|----------|---------|------|
+| binance_spot/futures | `stream.binance.com:9443` / `fstream.binance.com` | `{sym}@bookTicker` | Built-in 20s |
+| bybit_spot/futures | `stream.bybit.com/v5/public/spot\|linear` | `orderbook.1.{SYM}` | `{"op":"ping"}` 20s |
+| okx_spot/futures | `ws.okx.com:8443/ws/v5/public` | `tickers` instId | `"ping"` 25s |
+| gate_spot/futures | `api.gateio.ws/ws/v4/` / `fx-ws.gateio.ws` | `spot\|futures.book_ticker` | timestamped JSON 20s |
 
-### Key summary
+### ob collectors
 
-```
-md:{ex}:{mkt}:{sym}                  →  HASH 3 fields (b, a, t)
-md:hist:{ex}:{mkt}:{sym}:{chunk_id}  →  ZSET (bid|ask|ts_ms)
-md:hist:config                       →  STRING JSON
-ob:{ex}:{mkt}:{sym}                  →  HASH 41 fields (b1..b10, bq1..bq10, a1..a10, aq1..aq10, t)
-ob:hist:{ex}:{mkt}:{sym}:{chunk_id}  →  ZSET (b1|bq1|...|b10|bq10|a1|aq1|...|a10|aq10|ts_ms)
-ob:hist:config                       →  STRING JSON
-```
+| Collector | Channel | Update model |
+|-----------|---------|-------------|
+| ob_binance | `{sym}@depth20@100ms` | Full snapshot every 100ms |
+| ob_bybit | `orderbook.50.{SYM}` | Snapshot + incremental delta |
+| ob_okx | `books` | Snapshot + incremental (up to 400 levels), top-10 extracted |
+| ob_gate | `spot\|futures.order_book_update` | Full 20-level snapshot |
 
-### Health check
+---
+
+## ML Dataset
+
+`collectors/enrich_snapshot.py` converts raw snapshot CSVs into a machine-learning dataset.
 
 ```bash
-sudo bash setup_redis.sh --check
+# Process all snapshots in signals/snapshots/ → signals/ml_dataset.csv
+python3 collectors/enrich_snapshot.py
+
+# Rebuild from scratch (resets signal_history.db)
+python3 collectors/enrich_snapshot.py --rebuild
+
+# Process a single file
+python3 collectors/enrich_snapshot.py signals/snapshots/2026-03-21/11/gate_binance_BTCUSDT_20260321_110000.csv
+```
+
+Output: `signals/ml_dataset.csv` — one row per snapshot file, **65 features** + `converged` (target) + `split` (train/test).
+
+| Feature group | Features |
+|---------------|---------|
+| Spread dynamics | mean/std/min/max/slope/velocity/percentile over 5m/15m/30m/60m windows |
+| Order book | imbalance, volume, skew, walls, level-2/5 spreads, best spreads (at t=0) |
+| Funding rate | `fr_r_abs`, `mins_to_funding`, `funding_urgency` (fr_r × 1/mins²), `fr_favorable` |
+| Context | source IDs, direction_id, is_gate, hour/weekday/is_weekend |
+| Pair history | `repeat_count`, `hours_since_first`, `prev_converged`, `pair_success_rate` |
+
+`converged = 1` if spread drops below 0.3% at any point during the 3500s window.
+`pair_success_rate` is computed only from the training split (80% by time) to avoid data leakage.
+
+---
+
+## Logging
+
+All scripts emit JSON lines to stdout:
+
+```json
+{"ts": 1711234567.12, "lvl": "INFO", "script": "binance_spot", "event": "stats",
+ "msgs_total": 98808, "msgs_per_sec": 823.4, "flushes_total": 988, "avg_pipeline_ms": 0.412}
+```
+
+Common events: `startup`, `connecting`, `connected`, `subscribed`, `first_message`, `stats`, `disconnected`, `reconnecting`, `rest_refresh`, `collector_crashed`.
+
+Logs auto-written to `logs/collectors_YYYY-MM-DD_HH-MM.log` (12-hour rotation, 2 files kept).
+
+```bash
+tail -f logs/collectors_*.log | jq .
+jq 'select(.lvl == "WARN" or .lvl == "ERROR")' logs/collectors_*.log
+jq 'select(.event == "stats" and .script != "spread_monitor")' logs/collectors_*.log
+```
+
+---
+
+## Redis Health
+
+```bash
 redis-cli -s /var/run/redis/redis.sock PING
 redis-cli -s /var/run/redis/redis.sock INFO memory
 redis-cli -s /var/run/redis/redis.sock DBSIZE
 ```
 
-### Thresholds
+Thresholds (enforced by `redis_monitor.py`):
 
-| Metric | OK | WARN | CRIT |
-|--------|-----|------|------|
-| PING latency | < 1ms | > 1ms | timeout |
-| Memory usage | < 60% | > 60% | > 95% |
-| Fragmentation ratio | < 1.3 | > 1.3 | — |
-| Blocked clients | 0 | — | > 0 |
+| Metric | WARN | CRIT |
+|--------|------|------|
+| PING latency | > 6ms | > 30ms |
+| Write latency | > 15ms | > 60ms |
+| Memory usage | > 70% | > 85% |
+| Fragmentation ratio | > 1.5 | > 2.0 |
 
----
+Recommended maxmemory: **40 GB** (typical usage: ~500 MB with history).
 
-## Redis write pipeline
-
-All collectors use `pipeline(transaction=False)` with two flush triggers:
-- Batch reaches **100 commands**, or
-- **20ms** elapsed since last flush
-
-Inside each pipeline batch: `HSET` for current price/book + `ZADD` for history + `SET` for config (if dirty). No extra round-trips for history or config.
-
----
-
-## Updating Pair Lists
-
-```bash
-pkill -f run_all.py
-cd dictionaries && python3 main.py && cd ..
-python3 run_all.py
-```
-
----
-
-## Logs
-
-All logs are JSON, one object per line. Fields in every line: `ts`, `lvl`, `script`, `event`.
-
-```bash
-# Follow live
-tail -f logs/collectors_*.log | jq .
-
-# All errors and warnings
-jq 'select(.lvl == "WARN" or .lvl == "ERROR")' logs/collectors_*.log
-
-# Collector stats (msgs/s, pipeline latency)
-jq 'select(.event == "stats" and .script != "spread_monitor")' logs/collectors_*.log
-
-# OB-specific: book initializations
-jq 'select(.event == "book_init")' logs/collectors_*.log
-
-# OB-specific: shallow depth warnings
-jq 'select(.event == "stats" and .shallow_warnings > 0)' logs/collectors_*.log
-
-# Spread signals
-jq 'select(.event == "signal" or .event == "anomaly")' logs/collectors_*.log
-
-# Stale key alerts
-jq 'select(.event == "check" and .stale_count > 0)' logs/collectors_*.log
-
-# Subscription timing
-jq 'select(.event == "subscribed") | {script, subscribe_ms}' logs/collectors_*.log
-
-# Time to first message per collector
-jq 'select(.event == "first_message") | {script, ms_since_connected}' logs/collectors_*.log
-```
+**Important:** `volatile-ttl` eviction + no TTL on keys = OOM blocks ALL writes. Keep maxmemory ≥ 40 GB.

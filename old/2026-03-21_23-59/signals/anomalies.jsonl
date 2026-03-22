@@ -1,0 +1,3 @@
+{"ts":1774133867.866522,"direction":"gate_spot_binance_futures","symbol":"EDGEUSDT","spread_pct":443.1856,"spot_ask":"0.13222","fut_bid":"0.7182000","spot_ex":"gt","fut_ex":"bn"}
+{"ts":1774133879.6632948,"direction":"bitget_spot_gate_futures","symbol":"RTXUSDT","spread_pct":9123.301,"spot_ask":"2.1424","fut_bid":"197.6","spot_ex":"bg","fut_ex":"gt"}
+{"ts":1774133907.3783581,"direction":"binance_spot_bitget_futures","symbol":"FUNUSDT","spread_pct":2230.8931,"spot_ask":"0.00136600","fut_bid":"0.03184","spot_ex":"bn","fut_ex":"bg"}

@@ -24,6 +24,7 @@ Counters logged in stats (every 30s):
 """
 
 import asyncio
+import random
 import sys
 import time
 from pathlib import Path
@@ -45,7 +46,9 @@ WS_URL          = "wss://stream.bybit.com/v5/public/linear"
 LEVELS          = 10
 SUB_BATCH       = 200
 BATCH_SIZE      = 100
-BATCH_TIMEOUT   = 0.020
+_BATCH_JITTER   = random.uniform(0, 0.100)
+BATCH_TIMEOUT   = 0.200 + _BATCH_JITTER  # 200–300 ms, jittered per-process
+MAX_BATCH       = 150
 PING_INTERVAL   = 20
 STATS_INTERVAL  = 30
 RECONNECT_DELAY = 3
@@ -211,10 +214,13 @@ async def recv_loop(
             except Exception:
                 pass
 
-            if len(batch) >= BATCH_SIZE or (batch and now - last_flush >= BATCH_TIMEOUT):
+            if batch and (now - last_flush >= BATCH_TIMEOUT or len(batch) >= MAX_BATCH):
+                _bs = len(batch)
                 await flush(r, batch, hw, counters)
                 batch.clear()
                 last_flush = now
+                if _bs > 100:
+                    await asyncio.sleep(0)
 
     except (ConnectionClosed, asyncio.CancelledError):
         pass
@@ -224,8 +230,9 @@ async def recv_loop(
         if batch:
             try:
                 await flush(r, batch, hw, counters)
-            except Exception:
-                pass
+            except Exception as fe:
+                log("WARN", "flush_on_disconnect_failed",
+                    batch_size=len(batch), reason=str(fe)[:80])
 
 
 # ── main connection loop ──────────────────────────────────────────────────────
@@ -238,6 +245,7 @@ async def collect(
     books: dict,
 ) -> None:
     batches = chunk(syms, SUB_BATCH)
+    t_disconnect = None
     while True:
         books.clear()
         stop = asyncio.Event()
@@ -250,6 +258,10 @@ async def collect(
                 max_queue=4096,
             ) as ws:
                 t_connected = time.monotonic()
+                if t_disconnect is not None:
+                    log("INFO", "reconnected",
+                        downtime_sec=round(time.monotonic() - t_disconnect, 1))
+                    t_disconnect = None
                 log("INFO", "connected")
                 t_sub = time.monotonic()
                 for batch in batches:
@@ -276,6 +288,7 @@ async def collect(
 
         except (ConnectionClosed, OSError, Exception) as e:
             log("WARN", "disconnected", reason=str(e)[:120])
+            t_disconnect = time.monotonic()
             stop.set()
 
         log("INFO", "reconnecting", delay_sec=RECONNECT_DELAY)
@@ -285,12 +298,15 @@ async def collect(
 # ── stats ─────────────────────────────────────────────────────────────────────
 
 async def stats_loop(counters: dict, books: dict) -> None:
-    prev_msgs = 0
+    prev_msgs    = 0
+    prev_flushes = 0
+    prev_lat     = 0.0
     while True:
         await asyncio.sleep(STATS_INTERVAL)
         msgs    = counters["msgs"]
         rate    = (msgs - prev_msgs) / STATS_INTERVAL
-        avg_lat = counters["lat_total"] / counters["flushes"] if counters["flushes"] else 0.0
+        int_flushes = counters["flushes"] - prev_flushes
+        avg_lat     = (counters["lat_total"] - prev_lat) / int_flushes if int_flushes > 0 else 0.0
         avg_lvl = (counters["levels_total"] / counters["levels_count"]
                    if counters["levels_count"] else 0.0)
         log("INFO", "stats",
@@ -305,7 +321,9 @@ async def stats_loop(counters: dict, books: dict) -> None:
             avg_levels         = round(avg_lvl, 2),
             shallow_warnings   = counters["shallow"],
         )
-        prev_msgs = msgs
+        prev_msgs    = msgs
+        prev_flushes = counters["flushes"]
+        prev_lat     = counters["lat_total"]
 
 
 # ── main ──────────────────────────────────────────────────────────────────────

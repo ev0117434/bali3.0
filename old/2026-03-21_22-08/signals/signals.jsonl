@@ -1,0 +1,4 @@
+{"ts":1774117475.931375,"direction":"gate_spot_bybit_futures","symbol":"VANRYUSDT","spread_pct":7.6299,"spot_ask":"0.005544","fut_bid":"0.005967","spot_ex":"gt","fut_ex":"bb"}
+{"ts":1774120976.1447473,"direction":"gate_spot_bybit_futures","symbol":"VANRYUSDT","spread_pct":7.509,"spot_ask":"0.00554","fut_bid":"0.005956","spot_ex":"gt","fut_ex":"bb"}
+{"ts":1774124258.9698255,"direction":"gate_spot_okx_futures","symbol":"LIGHTUSDT","spread_pct":1.1538,"spot_ask":"0.234","fut_bid":"0.2367","spot_ex":"gt","fut_ex":"ok"}
+{"ts":1774124476.2909722,"direction":"gate_spot_bybit_futures","symbol":"VANRYUSDT","spread_pct":7.5253,"spot_ask":"0.005528","fut_bid":"0.005944","spot_ex":"gt","fut_ex":"bb"}

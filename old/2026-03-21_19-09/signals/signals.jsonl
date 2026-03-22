@@ -1,0 +1,8 @@
+{"ts":1774110878.196653,"direction":"gate_spot_bybit_futures","symbol":"VANRYUSDT","spread_pct":7.4576,"spot_ask":"0.005538","fut_bid":"0.005951","spot_ex":"gt","fut_ex":"bb"}
+{"ts":1774111302.9663608,"direction":"gate_spot_bybit_futures","symbol":"BSUUSDT","spread_pct":1.0315,"spot_ask":"0.05429","fut_bid":"0.05485","spot_ex":"gt","fut_ex":"bb"}
+{"ts":1774111463.4904838,"direction":"gate_spot_binance_futures","symbol":"NAORISUSDT","spread_pct":1.0623,"spot_ask":"0.06778","fut_bid":"0.0685000","spot_ex":"gt","fut_ex":"bn"}
+{"ts":1774111847.8592064,"direction":"gate_spot_binance_futures","symbol":"A2ZUSDT","spread_pct":1.0029,"spot_ask":"0.0005484","fut_bid":"0.0005539","spot_ex":"gt","fut_ex":"bn"}
+{"ts":1774112799.0831716,"direction":"gate_spot_binance_futures","symbol":"MAGMAUSDT","spread_pct":2.103,"spot_ask":"0.10794","fut_bid":"0.1102100","spot_ex":"gt","fut_ex":"bn"}
+{"ts":1774112799.0831716,"direction":"gate_spot_bybit_futures","symbol":"MAGMAUSDT","spread_pct":2.3532,"spot_ask":"0.10794","fut_bid":"0.11048","spot_ex":"gt","fut_ex":"bb"}
+{"ts":1774114378.415966,"direction":"gate_spot_bybit_futures","symbol":"VANRYUSDT","spread_pct":7.4167,"spot_ask":"0.005555","fut_bid":"0.005967","spot_ex":"gt","fut_ex":"bb"}
+{"ts":1774116401.2536008,"direction":"binance_spot_gate_futures","symbol":"NTRNUSDT","spread_pct":1.129,"spot_ask":"0.00620000","fut_bid":"0.00627","spot_ex":"bn","fut_ex":"gt"}

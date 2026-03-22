@@ -123,7 +123,7 @@ class OBHistWriter:
             "chunks":          chunks,
             "key_pattern":     "ob:hist:{ex}:{mkt}:{sym}:{chunk_id}",
             "member_format":   "b1|bq1|b2|bq2|...|b10|bq10|a1|aq1|...|a10|aq10|ts_ms",
-            "sources":         ["bn:s","bn:f","bb:s","bb:f","ok:s","ok:f","gt:s","gt:f"],
+            "sources":         ["bn:s","bn:f","bb:s","bb:f","ok:s","ok:f","gt:s","gt:f","bg:s","bg:f"],
         }
         pipe.set(CONFIG_KEY, orjson.dumps(config))
         self._dirty = False

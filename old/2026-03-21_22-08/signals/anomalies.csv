@@ -1,0 +1,4 @@
+spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
+binance,gate,FUNUSDT,0.00141300,0.03175,2146.9922,1774117535141
+binance,gate,FUNUSDT,0.00140300,0.03183,2168.7099,1774121035181
+binance,gate,FUNUSDT,0.00138200,0.03184,2203.9074,1774124535377

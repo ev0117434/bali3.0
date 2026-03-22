@@ -13,6 +13,7 @@ Protocol notes:
 """
 
 import asyncio
+import random
 import sys
 import time
 from pathlib import Path
@@ -34,8 +35,10 @@ CHANNEL         = "spot.book_ticker"
 
 SUB_BATCH       = 100
 BATCH_SIZE      = 100
-BATCH_TIMEOUT   = 0.020
-PING_INTERVAL   = 20
+_BATCH_JITTER   = random.uniform(0, 0.100)
+BATCH_TIMEOUT   = 0.200 + _BATCH_JITTER  # 200–300 ms, jittered per-process
+MAX_BATCH       = 400
+PING_INTERVAL   = 10
 STATS_INTERVAL  = 30
 RECONNECT_DELAY = 3
 
@@ -146,10 +149,13 @@ async def recv_loop(ws, r: aioredis.Redis, hw: HistWriter, counters: dict, stop:
                         first_logged[0] = True
             except Exception:
                 pass
-            if len(batch) >= BATCH_SIZE or (batch and now - last_flush >= BATCH_TIMEOUT):
+            if batch and (now - last_flush >= BATCH_TIMEOUT or len(batch) >= MAX_BATCH):
+                _bs = len(batch)
                 await flush(r, batch, hw, counters)
                 batch.clear()
                 last_flush = now
+                if _bs > 100:
+                    await asyncio.sleep(0)
     except (ConnectionClosed, asyncio.CancelledError):
         pass
     except Exception as e:
@@ -158,8 +164,9 @@ async def recv_loop(ws, r: aioredis.Redis, hw: HistWriter, counters: dict, stop:
         if batch:
             try:
                 await flush(r, batch, hw, counters)
-            except Exception:
-                pass
+            except Exception as fe:
+                log("WARN", "flush_on_disconnect_failed",
+                    batch_size=len(batch), reason=str(fe)[:80])
 
 
 # ── main connection loop ──────────────────────────────────────────────────────
@@ -167,6 +174,7 @@ async def recv_loop(ws, r: aioredis.Redis, hw: HistWriter, counters: dict, stop:
 async def collect(r: aioredis.Redis, syms: list[str], hw: HistWriter, counters: dict) -> None:
     native = [to_native(s) for s in syms]
     batches = chunk(native, SUB_BATCH)
+    t_disconnect = None
     while True:
         stop = asyncio.Event()
         try:
@@ -178,6 +186,10 @@ async def collect(r: aioredis.Redis, syms: list[str], hw: HistWriter, counters: 
                 max_queue=4096,
             ) as ws:
                 t_connected = time.monotonic()
+                if t_disconnect is not None:
+                    log("INFO", "reconnected",
+                        downtime_sec=round(time.monotonic() - t_disconnect, 1))
+                    t_disconnect = None
                 log("INFO", "connected")
                 t_sub = time.monotonic()
                 for batch in batches:
@@ -205,6 +217,7 @@ async def collect(r: aioredis.Redis, syms: list[str], hw: HistWriter, counters: 
 
         except (ConnectionClosed, OSError, Exception) as e:
             log("WARN", "disconnected", reason=str(e)[:120])
+            t_disconnect = time.monotonic()
             stop.set()
 
         log("INFO", "reconnecting", delay_sec=RECONNECT_DELAY)
@@ -214,18 +227,23 @@ async def collect(r: aioredis.Redis, syms: list[str], hw: HistWriter, counters: 
 # ── stats ─────────────────────────────────────────────────────────────────────
 
 async def stats_loop(counters: dict) -> None:
-    prev_msgs = 0
+    prev_msgs    = 0
+    prev_flushes = 0
+    prev_lat     = 0.0
     while True:
         await asyncio.sleep(STATS_INTERVAL)
         msgs = counters["msgs"]
         rate = (msgs - prev_msgs) / STATS_INTERVAL
-        avg_lat = counters["lat_total"] / counters["flushes"] if counters["flushes"] else 0.0
+        int_flushes = counters["flushes"] - prev_flushes
+        avg_lat     = (counters["lat_total"] - prev_lat) / int_flushes if int_flushes > 0 else 0.0
         log("INFO", "stats",
             msgs_total=msgs,
             msgs_per_sec=round(rate, 1),
             flushes_total=counters["flushes"],
             avg_pipeline_ms=round(avg_lat, 3))
-        prev_msgs = msgs
+        prev_msgs    = msgs
+        prev_flushes = counters["flushes"]
+        prev_lat     = counters["lat_total"]
 
 
 # ── main ──────────────────────────────────────────────────────────────────────

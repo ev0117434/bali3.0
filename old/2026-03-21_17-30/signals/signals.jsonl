@@ -1,0 +1,6 @@
+{"ts":1774108936.1984277,"direction":"gate_spot_bybit_futures","symbol":"VANRYUSDT","spread_pct":7.7117,"spot_ask":"0.005563","fut_bid":"0.005992","spot_ex":"gt","fut_ex":"bb"}
+{"ts":1774109210.6826286,"direction":"gate_spot_binance_futures","symbol":"A2ZUSDT","spread_pct":1.0263,"spot_ask":"0.0005554","fut_bid":"0.0005611","spot_ex":"gt","fut_ex":"bn"}
+{"ts":1774109362.4300644,"direction":"gate_spot_binance_futures","symbol":"ICNTUSDT","spread_pct":1.4141,"spot_ask":"0.34581","fut_bid":"0.3507000","spot_ex":"gt","fut_ex":"bn"}
+{"ts":1774109571.7709932,"direction":"okx_spot_bybit_futures","symbol":"VINEUSDT","spread_pct":1.0417,"spot_ask":"0.01728","fut_bid":"0.01746","spot_ex":"ok","fut_ex":"bb"}
+{"ts":1774109571.7709932,"direction":"okx_spot_gate_futures","symbol":"VINEUSDT","spread_pct":1.2731,"spot_ask":"0.01728","fut_bid":"0.0175","spot_ex":"ok","fut_ex":"gt"}
+{"ts":1774109939.4848661,"direction":"binance_spot_bybit_futures","symbol":"SXPUSDT","spread_pct":1.3095,"spot_ask":"0.00840000","fut_bid":"0.00851","spot_ex":"bn","fut_ex":"bb"}

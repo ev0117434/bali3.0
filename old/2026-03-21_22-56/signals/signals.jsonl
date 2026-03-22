@@ -1,0 +1,3 @@
+{"ts":1774130157.2363505,"direction":"gate_spot_bybit_futures","symbol":"VANRYUSDT","spread_pct":7.7794,"spot_ask":"0.005476","fut_bid":"0.005902","spot_ex":"gt","fut_ex":"bb"}
+{"ts":1774130157.5383093,"direction":"gate_spot_binance_futures","symbol":"VANRYUSDT","spread_pct":7.6333,"spot_ask":"0.005476","fut_bid":"0.0058940","spot_ex":"gt","fut_ex":"bn"}
+{"ts":1774130159.6447074,"direction":"gate_spot_binance_futures","symbol":"AIAUSDT","spread_pct":1.1064,"spot_ask":"0.094","fut_bid":"0.0950400","spot_ex":"gt","fut_ex":"bn"}

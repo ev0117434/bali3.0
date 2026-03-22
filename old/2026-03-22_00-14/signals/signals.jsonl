@@ -1,0 +1,5 @@
+{"ts":1774134245.4774313,"direction":"bitget_spot_binance_futures","symbol":"AIAUSDT","spread_pct":1.3318,"spot_ask":"0.09386","fut_bid":"0.0951100","spot_ex":"bg","fut_ex":"bn"}
+{"ts":1774134245.4774313,"direction":"gate_spot_binance_futures","symbol":"VANRYUSDT","spread_pct":7.7953,"spot_ask":"0.005452","fut_bid":"0.0058770","spot_ex":"gt","fut_ex":"bn"}
+{"ts":1774134245.4774313,"direction":"gate_spot_bitget_futures","symbol":"VANRYUSDT","spread_pct":7.9604,"spot_ask":"0.005452","fut_bid":"0.005886","spot_ex":"gt","fut_ex":"bg"}
+{"ts":1774134245.4774313,"direction":"gate_spot_bybit_futures","symbol":"VANRYUSDT","spread_pct":7.9787,"spot_ask":"0.005452","fut_bid":"0.005887","spot_ex":"gt","fut_ex":"bb"}
+{"ts":1774134331.4487596,"direction":"binance_spot_bybit_futures","symbol":"DEXEUSDT","spread_pct":1.5234,"spot_ask":"6.68900000","fut_bid":"6.7909","spot_ex":"bn","fut_ex":"bb"}

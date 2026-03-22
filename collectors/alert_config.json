@@ -1,0 +1,27 @@
+{
+  "_comment": "Telegram alert config for Bali 3.0. See collectors/telegram_alert.py for details.",
+
+  "bot_token": "7850126821:AAECl1j5kWtA0aWlBzWs23nniJNGM2NZJb4",
+  "chat_id":   ["6006401524", "1920800999"],
+
+  "min_spread_pct": 0.0,
+
+  "alerts": {
+    "signals":     true,
+    "anomalies":   true,
+    "crashes":     true,
+    "redis_crit":  true,
+    "redis_warn":  false,
+    "stale":       true,
+    "disconnects": true,
+    "startup":     true
+  },
+
+  "cooldowns": {
+    "redis_crit_sec":  300,
+    "redis_warn_sec":  600,
+    "stale_sec":       600,
+    "disconnect_sec":  300,
+    "crash_sec":       300
+  }
+}

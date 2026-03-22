@@ -21,7 +21,7 @@ REDIS_SOCK_DIR="/var/run/redis"
 REDIS_USER="redis"
 REDIS_GROUP="redis"
 APP_USER="${APP_USER:-$(logname 2>/dev/null || echo "${SUDO_USER:-root}")}"
-MAXMEMORY="2gb"
+MAXMEMORY="40gb"
 SYSCTL_CONF="/etc/sysctl.d/99-redis.conf"
 THP_SERVICE="/etc/systemd/system/disable-thp.service"
 LIMITS_CONF="/etc/security/limits.d/redis.conf"
@@ -236,10 +236,11 @@ if [[ "$REDIS_MAJOR" -ge 7 ]]; then
     cat >> "$REDIS_CONF" << EOF
 
 # --- Redis 7+ features ---
-io-threads 2
+io-threads 8
 io-threads-do-reads yes
 lazyfree-lazy-user-del yes
 activedefrag yes
+active-defrag-ignore-bytes 10mb
 EOF
     ok "redis.conf сгенерирован (Redis 7+ режим)"
 else
