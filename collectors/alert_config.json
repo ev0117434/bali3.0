@@ -1,8 +1,7 @@
 {
   "_comment": "Telegram alert config for Bali 3.0. See collectors/telegram_alert.py for details.",
 
-  "bot_token": "7850126821:AAECl1j5kWtA0aWlBzWs23nniJNGM2NZJb4",
-  "chat_id":   ["6006401524", "1920800999"],
+  
 
   "min_spread_pct": 0.0,
 
